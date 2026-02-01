@@ -1,0 +1,17 @@
+[configuration]
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = 4.2
+reloadable = true
+
+[libraries]
+; Linux
+linux.debug.x86_64 = "res://addons/voxelis/libgodot_voxelis.so"
+linux.release.x86_64 = "res://addons/voxelis/libgodot_voxelis.so"
+
+; Windows
+windows.debug.x86_64 = "res://addons/voxelis/godot_voxelis.dll"
+windows.release.x86_64 = "res://addons/voxelis/godot_voxelis.dll"
+
+; macOS (Universal Binary)
+macos.debug = "res://addons/voxelis/libgodot_voxelis.dylib"
+macos.release = "res://addons/voxelis/libgodot_voxelis.dylib"

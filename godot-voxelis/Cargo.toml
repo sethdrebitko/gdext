@@ -1,0 +1,27 @@
+[package]
+name = "godot-voxelis"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+description = "Godot bindings for the Voxelis voxel engine - Sparse Voxel Octree DAG"
+keywords = ["godot", "voxel", "voxelis", "svo", "gamedev"]
+categories = ["game-development", "graphics"]
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = []
+# Forward features to godot crate
+codegen-full = ["godot/__codegen-full"]
+experimental-godot-api = ["godot/experimental-godot-api"]
+serde = ["godot/serde"]
+
+[dependencies]
+godot = { path = "../godot", default-features = false }
+# Voxelis - Sparse Voxel Octree DAG engine
+voxelis = { git = "https://github.com/WildPixelGames/voxelis", branch = "master" }
+# Math library - use same version as voxelis
+glam = "0.29"
