@@ -7,6 +7,9 @@
 
 use godot::prelude::*;
 
+#[cfg(feature = "voxelis")]
+mod voxel_world;
+
 struct HotReload;
 
 #[gdextension]

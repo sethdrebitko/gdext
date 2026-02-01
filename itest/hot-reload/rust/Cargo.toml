@@ -9,5 +9,11 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = []
+voxelis = ["dep:glam_029", "dep:voxelis"]
+
 [dependencies]
+glam_029 = { workspace = true, optional = true }
 godot = { path = "../../../godot", default-features = false }
+voxelis = { workspace = true, optional = true }
