@@ -1512,4 +1512,1082 @@ impl VoxelMesher {
 
         dict
     }
+
+    /// Generates a mesh using a VoxelPalette for colors and textures.
+    ///
+    /// # Arguments
+    /// * `interner` - The VoxelInterner managing memory
+    /// * `tree` - The VoxelTree to generate a mesh from
+    /// * `palette` - The VoxelPalette defining voxel type properties
+    ///
+    /// # Returns
+    /// An ArrayMesh containing the rendered voxels with palette colors/UVs
+    #[func]
+    pub fn generate_mesh_with_palette(
+        &self,
+        interner: Gd<VoxelInterner>,
+        tree: Gd<VoxelTree>,
+        palette: Gd<VoxelPalette>,
+    ) -> Gd<ArrayMesh> {
+        let tree_bind = tree.bind();
+        let Some(ref vox_tree) = tree_bind.tree else {
+            godot_error!("VoxelTree not initialized");
+            return ArrayMesh::new_gd();
+        };
+
+        let interner_arc = interner.bind().get_arc();
+        let interner_guard = interner_arc.read().unwrap();
+        let palette_bind = palette.bind();
+
+        let max_depth = tree_bind.max_depth;
+        let resolution = 1i32 << max_depth;
+
+        self.generate_mesh_with_palette_internal(
+            &interner_guard,
+            vox_tree,
+            resolution,
+            IVec3::ZERO,
+            &palette_bind,
+        )
+    }
+
+    /// Internal method to generate mesh with palette
+    fn generate_mesh_with_palette_internal(
+        &self,
+        interner: &VoxInterner<u16>,
+        tree: &VoxTree<u16>,
+        resolution: i32,
+        offset: IVec3,
+        palette: &VoxelPalette,
+    ) -> Gd<ArrayMesh> {
+        let mut vertices = PackedVector3Array::new();
+        let mut normals = PackedVector3Array::new();
+        let mut colors = PackedColorArray::new();
+        let mut uvs = PackedVector2Array::new();
+        let mut indices = PackedInt32Array::new();
+
+        let mut vertex_count = 0i32;
+
+        // Iterate through all voxels
+        for x in 0..resolution {
+            for y in 0..resolution {
+                for z in 0..resolution {
+                    let pos = IVec3::new(x, y, z);
+                    let voxel = tree.get(interner, pos);
+
+                    if let Some(voxel_type) = voxel {
+                        if voxel_type == 0 {
+                            continue;
+                        }
+
+                        let voxel_info = palette.get_voxel_type_internal(voxel_type);
+                        let color = voxel_info.color;
+
+                        // Check each face direction
+                        for dir in ALL_DIRECTIONS {
+                            let neighbor_pos = pos + dir.offset();
+
+                            let is_face_visible = if neighbor_pos.x < 0
+                                || neighbor_pos.x >= resolution
+                                || neighbor_pos.y < 0
+                                || neighbor_pos.y >= resolution
+                                || neighbor_pos.z < 0
+                                || neighbor_pos.z >= resolution
+                            {
+                                true
+                            } else {
+                                let neighbor = tree.get(interner, neighbor_pos);
+                                neighbor.is_none() || neighbor == Some(0)
+                            };
+
+                            if is_face_visible {
+                                let world_pos = pos + offset;
+                                let face_verts = dir.vertices(world_pos, self.voxel_size);
+                                let normal = dir.normal();
+
+                                // Get UV coordinates from palette
+                                let face_uvs = if palette.atlas_size > 0 {
+                                    palette.get_atlas_uvs(&voxel_info, dir)
+                                } else {
+                                    dir.uvs()
+                                };
+
+                                for (vert, uv) in face_verts.iter().zip(face_uvs.iter()) {
+                                    vertices.push(*vert);
+                                    normals.push(normal);
+                                    colors.push(color);
+                                    uvs.push(*uv);
+                                }
+
+                                indices.push(vertex_count);
+                                indices.push(vertex_count + 1);
+                                indices.push(vertex_count + 2);
+                                indices.push(vertex_count);
+                                indices.push(vertex_count + 2);
+                                indices.push(vertex_count + 3);
+
+                                vertex_count += 4;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.build_array_mesh(vertices, normals, colors, uvs, indices)
+    }
+}
+
+// ============================================================================
+// VoxelPalette - Voxel type definitions and texture atlas support
+// ============================================================================
+
+/// Information about a single voxel type
+#[derive(Clone, Debug)]
+struct VoxelTypeInfo {
+    /// Display name for this voxel type
+    name: String,
+    /// Base color for this voxel type
+    color: Color,
+    /// Atlas tile X coordinate (0-based)
+    atlas_x: i32,
+    /// Atlas tile Y coordinate (0-based)
+    atlas_y: i32,
+    /// Whether this voxel type is transparent
+    transparent: bool,
+    /// Whether this voxel type emits light
+    emissive: bool,
+    /// Emission color (if emissive)
+    emission_color: Color,
+}
+
+impl Default for VoxelTypeInfo {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            color: Color::from_rgb(1.0, 0.0, 1.0), // Magenta for undefined
+            atlas_x: 0,
+            atlas_y: 0,
+            transparent: false,
+            emissive: false,
+            emission_color: Color::BLACK,
+        }
+    }
+}
+
+/// A palette defining voxel type properties for rendering and gameplay.
+///
+/// VoxelPalette allows you to define colors, textures, and properties for each
+/// voxel type, enabling rich visual variety and gameplay mechanics.
+///
+/// # Texture Atlas Support
+/// When using a texture atlas, set `atlas_size` to the number of tiles per row/column,
+/// then assign `atlas_x` and `atlas_y` coordinates for each voxel type.
+///
+/// # Example
+/// ```gdscript
+/// var palette = VoxelPalette.create()
+///
+/// # Define voxel types with colors
+/// palette.add_type(1, "Stone", Color(0.5, 0.5, 0.5))
+/// palette.add_type(2, "Dirt", Color(0.6, 0.4, 0.2))
+/// palette.add_type(3, "Grass", Color(0.3, 0.7, 0.2))
+///
+/// # Or use a texture atlas (16x16 tiles)
+/// palette.set_atlas_size(16)
+/// palette.add_type_with_atlas(1, "Stone", Color.WHITE, 0, 0)  # Top-left tile
+/// palette.add_type_with_atlas(2, "Dirt", Color.WHITE, 1, 0)   # Second tile
+/// palette.add_type_with_atlas(3, "Grass", Color.WHITE, 2, 0)  # Third tile
+/// ```
+#[derive(GodotClass)]
+#[class(base=RefCounted, init)]
+pub struct VoxelPalette {
+    /// Voxel type definitions
+    types: std::collections::HashMap<u16, VoxelTypeInfo>,
+    /// Atlas size (tiles per row/column, 0 = no atlas)
+    atlas_size: i32,
+    base: Base<RefCounted>,
+}
+
+#[godot_api]
+impl VoxelPalette {
+    /// Creates a new empty VoxelPalette.
+    #[func]
+    pub fn create() -> Gd<Self> {
+        Gd::from_init_fn(|base| Self {
+            types: std::collections::HashMap::new(),
+            atlas_size: 0,
+            base,
+        })
+    }
+
+    /// Creates a palette with default terrain voxel types.
+    #[func]
+    pub fn create_default() -> Gd<Self> {
+        let mut types = std::collections::HashMap::new();
+
+        // Default terrain palette
+        types.insert(
+            1,
+            VoxelTypeInfo {
+                name: "Stone".to_string(),
+                color: Color::from_rgb(0.5, 0.5, 0.55),
+                atlas_x: 0,
+                atlas_y: 0,
+                ..Default::default()
+            },
+        );
+        types.insert(
+            2,
+            VoxelTypeInfo {
+                name: "Dirt".to_string(),
+                color: Color::from_rgb(0.6, 0.45, 0.3),
+                atlas_x: 1,
+                atlas_y: 0,
+                ..Default::default()
+            },
+        );
+        types.insert(
+            3,
+            VoxelTypeInfo {
+                name: "Grass".to_string(),
+                color: Color::from_rgb(0.35, 0.65, 0.25),
+                atlas_x: 2,
+                atlas_y: 0,
+                ..Default::default()
+            },
+        );
+        types.insert(
+            4,
+            VoxelTypeInfo {
+                name: "Sand".to_string(),
+                color: Color::from_rgb(0.9, 0.85, 0.6),
+                atlas_x: 3,
+                atlas_y: 0,
+                ..Default::default()
+            },
+        );
+        types.insert(
+            5,
+            VoxelTypeInfo {
+                name: "Water".to_string(),
+                color: Color::from_rgba(0.2, 0.4, 0.8, 0.7),
+                atlas_x: 4,
+                atlas_y: 0,
+                transparent: true,
+                ..Default::default()
+            },
+        );
+        types.insert(
+            6,
+            VoxelTypeInfo {
+                name: "Wood".to_string(),
+                color: Color::from_rgb(0.55, 0.35, 0.2),
+                atlas_x: 5,
+                atlas_y: 0,
+                ..Default::default()
+            },
+        );
+        types.insert(
+            7,
+            VoxelTypeInfo {
+                name: "Leaves".to_string(),
+                color: Color::from_rgba(0.2, 0.5, 0.15, 0.9),
+                atlas_x: 6,
+                atlas_y: 0,
+                transparent: true,
+                ..Default::default()
+            },
+        );
+        types.insert(
+            8,
+            VoxelTypeInfo {
+                name: "Ore".to_string(),
+                color: Color::from_rgb(0.7, 0.6, 0.4),
+                atlas_x: 7,
+                atlas_y: 0,
+                ..Default::default()
+            },
+        );
+        types.insert(
+            9,
+            VoxelTypeInfo {
+                name: "Lava".to_string(),
+                color: Color::from_rgb(1.0, 0.4, 0.1),
+                atlas_x: 8,
+                atlas_y: 0,
+                emissive: true,
+                emission_color: Color::from_rgb(1.0, 0.5, 0.2),
+                ..Default::default()
+            },
+        );
+        types.insert(
+            10,
+            VoxelTypeInfo {
+                name: "Glass".to_string(),
+                color: Color::from_rgba(0.8, 0.9, 1.0, 0.3),
+                atlas_x: 9,
+                atlas_y: 0,
+                transparent: true,
+                ..Default::default()
+            },
+        );
+
+        Gd::from_init_fn(|base| Self {
+            types,
+            atlas_size: 0,
+            base,
+        })
+    }
+
+    /// Adds a voxel type with the specified color.
+    ///
+    /// # Arguments
+    /// * `voxel_type` - The voxel value (1-65535, 0 is reserved for empty)
+    /// * `name` - Display name for this voxel type
+    /// * `color` - Base color for rendering
+    #[func]
+    pub fn add_type(&mut self, voxel_type: i32, name: GString, color: Color) {
+        if voxel_type <= 0 || voxel_type > 65535 {
+            godot_warn!("VoxelPalette: voxel_type must be 1-65535");
+            return;
+        }
+
+        self.types.insert(
+            voxel_type as u16,
+            VoxelTypeInfo {
+                name: name.to_string(),
+                color,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Adds a voxel type with atlas texture coordinates.
+    ///
+    /// # Arguments
+    /// * `voxel_type` - The voxel value (1-65535)
+    /// * `name` - Display name for this voxel type
+    /// * `color` - Tint color (use WHITE for no tint)
+    /// * `atlas_x` - X coordinate in the texture atlas (0-based)
+    /// * `atlas_y` - Y coordinate in the texture atlas (0-based)
+    #[func]
+    pub fn add_type_with_atlas(
+        &mut self,
+        voxel_type: i32,
+        name: GString,
+        color: Color,
+        atlas_x: i32,
+        atlas_y: i32,
+    ) {
+        if voxel_type <= 0 || voxel_type > 65535 {
+            godot_warn!("VoxelPalette: voxel_type must be 1-65535");
+            return;
+        }
+
+        self.types.insert(
+            voxel_type as u16,
+            VoxelTypeInfo {
+                name: name.to_string(),
+                color,
+                atlas_x,
+                atlas_y,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Sets whether a voxel type is transparent.
+    #[func]
+    pub fn set_transparent(&mut self, voxel_type: i32, transparent: bool) {
+        if let Some(info) = self.types.get_mut(&(voxel_type as u16)) {
+            info.transparent = transparent;
+        }
+    }
+
+    /// Sets whether a voxel type is emissive (glowing).
+    #[func]
+    pub fn set_emissive(&mut self, voxel_type: i32, emissive: bool, emission_color: Color) {
+        if let Some(info) = self.types.get_mut(&(voxel_type as u16)) {
+            info.emissive = emissive;
+            info.emission_color = emission_color;
+        }
+    }
+
+    /// Sets the atlas size (tiles per row/column).
+    ///
+    /// Set to 0 to disable atlas mode and use solid colors.
+    #[func]
+    pub fn set_atlas_size(&mut self, size: i32) {
+        self.atlas_size = size.max(0);
+    }
+
+    /// Gets the atlas size.
+    #[func]
+    pub fn get_atlas_size(&self) -> i32 {
+        self.atlas_size
+    }
+
+    /// Gets the color for a voxel type.
+    #[func]
+    pub fn get_color(&self, voxel_type: i32) -> Color {
+        self.types
+            .get(&(voxel_type as u16))
+            .map(|t| t.color)
+            .unwrap_or(Color::from_rgb(1.0, 0.0, 1.0))
+    }
+
+    /// Gets the name of a voxel type.
+    #[func]
+    pub fn get_name(&self, voxel_type: i32) -> GString {
+        self.types
+            .get(&(voxel_type as u16))
+            .map(|t| GString::from(&t.name))
+            .unwrap_or_else(|| GString::from("Unknown"))
+    }
+
+    /// Gets whether a voxel type is transparent.
+    #[func]
+    pub fn is_transparent(&self, voxel_type: i32) -> bool {
+        self.types
+            .get(&(voxel_type as u16))
+            .is_some_and(|t| t.transparent)
+    }
+
+    /// Gets whether a voxel type is emissive.
+    #[func]
+    pub fn is_emissive(&self, voxel_type: i32) -> bool {
+        self.types
+            .get(&(voxel_type as u16))
+            .is_some_and(|t| t.emissive)
+    }
+
+    /// Returns the number of defined voxel types.
+    #[func]
+    pub fn get_type_count(&self) -> i32 {
+        self.types.len() as i32
+    }
+
+    /// Returns all defined voxel type IDs.
+    #[func]
+    pub fn get_all_types(&self) -> PackedInt32Array {
+        let mut arr = PackedInt32Array::new();
+        for &id in self.types.keys() {
+            arr.push(id as i32);
+        }
+        arr
+    }
+
+    /// Exports the palette to a dictionary for saving.
+    #[func]
+    pub fn to_dictionary(&self) -> VarDictionary {
+        let mut dict = VarDictionary::new();
+        dict.set("atlas_size", self.atlas_size);
+
+        let mut types_dict = VarDictionary::new();
+        for (&id, info) in &self.types {
+            let mut type_dict = VarDictionary::new();
+            type_dict.set("name", GString::from(&info.name));
+            type_dict.set("color", info.color);
+            type_dict.set("atlas_x", info.atlas_x);
+            type_dict.set("atlas_y", info.atlas_y);
+            type_dict.set("transparent", info.transparent);
+            type_dict.set("emissive", info.emissive);
+            type_dict.set("emission_color", info.emission_color);
+            types_dict.set(id as i32, type_dict);
+        }
+        dict.set("types", types_dict);
+
+        dict
+    }
+
+    /// Loads the palette from a dictionary.
+    #[func]
+    pub fn from_dictionary(dict: VarDictionary) -> Gd<Self> {
+        let atlas_size = dict
+            .get("atlas_size")
+            .map(|v| v.try_to::<i32>().unwrap_or(0))
+            .unwrap_or(0);
+
+        let mut types = std::collections::HashMap::new();
+
+        if let Some(types_var) = dict.get("types") {
+            if let Ok(types_dict) = types_var.try_to::<VarDictionary>() {
+                for key in types_dict.keys_array().iter_shared() {
+                    if let Ok(id) = key.try_to::<i32>() {
+                        if let Some(type_var) = types_dict.get(key.clone()) {
+                            if let Ok(type_dict) = type_var.try_to::<VarDictionary>() {
+                                let info = VoxelTypeInfo {
+                                    name: type_dict
+                                        .get("name")
+                                        .and_then(|v| v.try_to::<GString>().ok())
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_default(),
+                                    color: type_dict
+                                        .get("color")
+                                        .and_then(|v| v.try_to::<Color>().ok())
+                                        .unwrap_or(Color::from_rgb(1.0, 0.0, 1.0)),
+                                    atlas_x: type_dict
+                                        .get("atlas_x")
+                                        .and_then(|v| v.try_to::<i32>().ok())
+                                        .unwrap_or(0),
+                                    atlas_y: type_dict
+                                        .get("atlas_y")
+                                        .and_then(|v| v.try_to::<i32>().ok())
+                                        .unwrap_or(0),
+                                    transparent: type_dict
+                                        .get("transparent")
+                                        .and_then(|v| v.try_to::<bool>().ok())
+                                        .unwrap_or(false),
+                                    emissive: type_dict
+                                        .get("emissive")
+                                        .and_then(|v| v.try_to::<bool>().ok())
+                                        .unwrap_or(false),
+                                    emission_color: type_dict
+                                        .get("emission_color")
+                                        .and_then(|v| v.try_to::<Color>().ok())
+                                        .unwrap_or(Color::BLACK),
+                                };
+                                types.insert(id as u16, info);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Gd::from_init_fn(|base| Self {
+            types,
+            atlas_size,
+            base,
+        })
+    }
+
+    /// Internal method to get voxel type info
+    fn get_voxel_type_internal(&self, voxel_type: u16) -> VoxelTypeInfo {
+        self.types.get(&voxel_type).cloned().unwrap_or_default()
+    }
+
+    /// Calculate UV coordinates for a face using the atlas
+    fn get_atlas_uvs(&self, info: &VoxelTypeInfo, _dir: FaceDirection) -> [Vector2; 4] {
+        if self.atlas_size <= 0 {
+            return FaceDirection::Top.uvs();
+        }
+
+        let tile_size = 1.0 / self.atlas_size as f32;
+        let u0 = info.atlas_x as f32 * tile_size;
+        let v0 = info.atlas_y as f32 * tile_size;
+        let u1 = u0 + tile_size;
+        let v1 = v0 + tile_size;
+
+        // Small inset to prevent texture bleeding
+        let inset = tile_size * 0.01;
+
+        [
+            Vector2::new(u0 + inset, v1 - inset),
+            Vector2::new(u0 + inset, v0 + inset),
+            Vector2::new(u1 - inset, v0 + inset),
+            Vector2::new(u1 - inset, v1 - inset),
+        ]
+    }
+}
+
+// ============================================================================
+// VoxelImporter - Import voxel models from external formats
+// ============================================================================
+
+/// Importer for voxel model files.
+///
+/// Supports importing from:
+/// - MagicaVoxel (.vox) files
+/// - Raw voxel data
+///
+/// # Example
+/// ```gdscript
+/// var importer = VoxelImporter.new()
+/// var result = importer.load_vox("res://models/house.vox", interner)
+/// if result.success:
+///     var tree = result.tree
+///     var palette = result.palette
+/// ```
+#[derive(GodotClass)]
+#[class(base=RefCounted, init)]
+pub struct VoxelImporter {
+    base: Base<RefCounted>,
+}
+
+#[godot_api]
+impl VoxelImporter {
+    /// Loads a MagicaVoxel .vox file.
+    ///
+    /// # Arguments
+    /// * `path` - Path to the .vox file
+    /// * `interner` - VoxelInterner for memory management
+    ///
+    /// # Returns
+    /// A dictionary with:
+    /// - `success`: bool - Whether loading succeeded
+    /// - `tree`: VoxelTree - The loaded voxel data (if successful)
+    /// - `palette`: VoxelPalette - Color palette from the file
+    /// - `size`: Vector3i - Dimensions of the model
+    /// - `error`: String - Error message (if failed)
+    #[func]
+    pub fn load_vox(&self, path: GString, interner: Gd<VoxelInterner>) -> VarDictionary {
+        let mut result = VarDictionary::new();
+
+        // Read file bytes
+        let file_access = godot::classes::FileAccess::open(
+            &path,
+            godot::classes::file_access::ModeFlags::READ,
+        );
+
+        let Some(file) = file_access else {
+            result.set("success", false);
+            result.set("error", GString::from("Failed to open file"));
+            return result;
+        };
+
+        let length = file.get_length() as usize;
+        let bytes = file.get_buffer(length as i64);
+
+        // Parse VOX file
+        match self.parse_vox_bytes(&bytes) {
+            Ok((voxels, size, palette_colors)) => {
+                // Calculate required depth
+                let max_dim = size.x.max(size.y).max(size.z);
+                let depth = (max_dim as f32).log2().ceil() as i32;
+                let depth = depth.clamp(1, 7);
+
+                // Create tree
+                let mut tree = VoxelTree::create(depth);
+
+                // Fill voxels using set_voxel
+                {
+                    let mut tree_bind = tree.bind_mut();
+                    for (pos, voxel_type) in &voxels {
+                        tree_bind.set_voxel(
+                            interner.clone(),
+                            Vector3i::new(pos.x, pos.y, pos.z),
+                            *voxel_type as i32,
+                        );
+                    }
+                }
+
+                // Create palette from VOX colors
+                let palette = self.create_palette_from_vox_colors(&palette_colors);
+
+                result.set("success", true);
+                result.set("tree", tree);
+                result.set("palette", palette);
+                result.set("size", Vector3i::new(size.x, size.y, size.z));
+            }
+            Err(err) => {
+                result.set("success", false);
+                result.set("error", GString::from(err.as_str()));
+            }
+        }
+
+        result
+    }
+
+    /// Creates a VoxelTree from raw voxel data.
+    ///
+    /// # Arguments
+    /// * `interner` - VoxelInterner for memory management
+    /// * `data` - PackedByteArray with voxel data (x, y, z, type for each voxel)
+    /// * `depth` - Tree depth (determines max resolution)
+    ///
+    /// # Returns
+    /// A VoxelTree containing the imported data
+    #[func]
+    pub fn from_raw_data(
+        &self,
+        interner: Gd<VoxelInterner>,
+        data: PackedByteArray,
+        depth: i32,
+    ) -> Gd<VoxelTree> {
+        let mut tree = VoxelTree::create(depth);
+
+        let bytes = data.as_slice();
+        let len = bytes.len();
+
+        // Each voxel is 4 bytes: x, y, z, type
+        if !len.is_multiple_of(4) {
+            godot_warn!("VoxelImporter: Raw data length must be multiple of 4");
+            return tree;
+        }
+
+        {
+            let mut tree_bind = tree.bind_mut();
+            for chunk in bytes.chunks_exact(4) {
+                let x = chunk[0] as i32;
+                let y = chunk[1] as i32;
+                let z = chunk[2] as i32;
+                let voxel_type = chunk[3] as i32;
+
+                tree_bind.set_voxel(interner.clone(), Vector3i::new(x, y, z), voxel_type);
+            }
+        }
+
+        tree
+    }
+
+    /// Exports a VoxelTree to raw voxel data.
+    ///
+    /// # Arguments
+    /// * `interner` - VoxelInterner for memory management
+    /// * `tree` - The VoxelTree to export
+    ///
+    /// # Returns
+    /// PackedByteArray with voxel data (x, y, z, type for each non-empty voxel)
+    #[func]
+    pub fn to_raw_data(&self, interner: Gd<VoxelInterner>, tree: Gd<VoxelTree>) -> PackedByteArray {
+        let mut data = PackedByteArray::new();
+
+        let tree_bind = tree.bind();
+        let Some(ref vox_tree) = tree_bind.tree else {
+            return data;
+        };
+
+        let interner_arc = interner.bind().get_arc();
+        let interner_guard = interner_arc.read().unwrap();
+
+        let resolution = 1i32 << tree_bind.max_depth;
+
+        for x in 0..resolution {
+            for y in 0..resolution {
+                for z in 0..resolution {
+                    let pos = IVec3::new(x, y, z);
+                    if let Some(voxel_type) = vox_tree.get(&interner_guard, pos) {
+                        if voxel_type > 0 {
+                            data.push(x as u8);
+                            data.push(y as u8);
+                            data.push(z as u8);
+                            data.push(voxel_type as u8);
+                        }
+                    }
+                }
+            }
+        }
+
+        data
+    }
+
+    /// Parse MagicaVoxel .vox file bytes
+    fn parse_vox_bytes(
+        &self,
+        bytes: &PackedByteArray,
+    ) -> Result<(Vec<(IVec3, u16)>, IVec3, Vec<Color>), String> {
+        let data = bytes.as_slice();
+        let len = data.len();
+
+        if len < 8 {
+            return Err("File too small".to_string());
+        }
+
+        // Check magic number "VOX "
+        if data[0] != b'V' || data[1] != b'O' || data[2] != b'X' || data[3] != b' ' {
+            return Err("Invalid VOX magic number".to_string());
+        }
+
+        // Read version (bytes 4-7)
+        let _version = self.read_u32_slice(data, 4);
+
+        let mut voxels = Vec::new();
+        let mut size = IVec3::new(1, 1, 1);
+        let mut palette_colors = self.default_vox_palette();
+
+        // Parse chunks
+        let mut offset = 8;
+        while offset + 12 <= len {
+            let chunk_id = &data[offset..offset + 4];
+            let chunk_size = self.read_u32_slice(data, offset + 4) as usize;
+            let _children_size = self.read_u32_slice(data, offset + 8) as usize;
+
+            let chunk_data_start = offset + 12;
+            let chunk_data_end = chunk_data_start + chunk_size;
+
+            if chunk_data_end > len {
+                break;
+            }
+
+            match chunk_id {
+                b"SIZE" => {
+                    if chunk_size >= 12 {
+                        size.x = self.read_u32_slice(data, chunk_data_start) as i32;
+                        size.y = self.read_u32_slice(data, chunk_data_start + 4) as i32;
+                        size.z = self.read_u32_slice(data, chunk_data_start + 8) as i32;
+                    }
+                }
+                b"XYZI" => {
+                    if chunk_size >= 4 {
+                        let num_voxels = self.read_u32_slice(data, chunk_data_start) as usize;
+                        let voxel_data_start = chunk_data_start + 4;
+
+                        for i in 0..num_voxels {
+                            let voxel_offset = voxel_data_start + i * 4;
+                            if voxel_offset + 4 <= len {
+                                let x = data[voxel_offset] as i32;
+                                let y = data[voxel_offset + 1] as i32;
+                                let z = data[voxel_offset + 2] as i32;
+                                let color_index = data[voxel_offset + 3] as u16;
+
+                                // VOX uses Z-up, we convert to Y-up
+                                voxels.push((IVec3::new(x, z, y), color_index));
+                            }
+                        }
+                    }
+                }
+                b"RGBA" => {
+                    // Custom palette
+                    palette_colors.clear();
+                    palette_colors.push(Color::from_rgba(0.0, 0.0, 0.0, 0.0)); // Index 0 is empty
+
+                    for i in 0..256 {
+                        let color_offset = chunk_data_start + i * 4;
+                        if color_offset + 4 <= len {
+                            let r = data[color_offset] as f32 / 255.0;
+                            let g = data[color_offset + 1] as f32 / 255.0;
+                            let b = data[color_offset + 2] as f32 / 255.0;
+                            let a = data[color_offset + 3] as f32 / 255.0;
+                            palette_colors.push(Color::from_rgba(r, g, b, a));
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            offset = chunk_data_end;
+        }
+
+        // Swap size Y and Z for coordinate system conversion
+        let converted_size = IVec3::new(size.x, size.z, size.y);
+
+        Ok((voxels, converted_size, palette_colors))
+    }
+
+    /// Read a little-endian u32 from a byte slice
+    fn read_u32_slice(&self, data: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ])
+    }
+
+    /// Default MagicaVoxel palette (when RGBA chunk is not present)
+    fn default_vox_palette(&self) -> Vec<Color> {
+        let mut colors = vec![Color::from_rgba(0.0, 0.0, 0.0, 0.0)]; // Index 0
+
+        // Simplified default palette
+        for i in 1..=255 {
+            let h = (i as f32 / 255.0) * 360.0;
+            let s = 0.7;
+            let v = 0.9;
+
+            let color = Color::from_hsv(h as f64 / 360.0, s, v);
+            colors.push(color);
+        }
+
+        colors
+    }
+
+    /// Create a VoxelPalette from VOX palette colors
+    fn create_palette_from_vox_colors(&self, colors: &[Color]) -> Gd<VoxelPalette> {
+        let mut types = std::collections::HashMap::new();
+
+        for (i, color) in colors.iter().enumerate().skip(1) {
+            // Skip index 0
+            if i > 255 {
+                break;
+            }
+
+            types.insert(
+                i as u16,
+                VoxelTypeInfo {
+                    name: format!("Color {}", i),
+                    color: *color,
+                    atlas_x: (i % 16) as i32,
+                    atlas_y: (i / 16) as i32,
+                    transparent: color.a < 1.0,
+                    ..Default::default()
+                },
+            );
+        }
+
+        Gd::from_init_fn(|base| VoxelPalette {
+            types,
+            atlas_size: 0,
+            base,
+        })
+    }
+}
+
+// ============================================================================
+// VoxelExporter - Export voxel data to various formats
+// ============================================================================
+
+/// Exporter for voxel data to various formats.
+///
+/// # Example
+/// ```gdscript
+/// var exporter = VoxelExporter.new()
+/// exporter.save_vox("res://output/model.vox", interner, tree, palette)
+/// ```
+#[derive(GodotClass)]
+#[class(base=RefCounted, init)]
+pub struct VoxelExporter {
+    base: Base<RefCounted>,
+}
+
+#[godot_api]
+impl VoxelExporter {
+    /// Exports a VoxelTree to MagicaVoxel .vox format.
+    ///
+    /// # Arguments
+    /// * `path` - Output file path
+    /// * `interner` - VoxelInterner for memory management
+    /// * `tree` - The VoxelTree to export
+    /// * `palette` - The VoxelPalette for colors
+    ///
+    /// # Returns
+    /// true if export succeeded
+    #[func]
+    pub fn save_vox(
+        &self,
+        path: GString,
+        interner: Gd<VoxelInterner>,
+        tree: Gd<VoxelTree>,
+        palette: Gd<VoxelPalette>,
+    ) -> bool {
+        let tree_bind = tree.bind();
+        let Some(ref vox_tree) = tree_bind.tree else {
+            godot_error!("VoxelTree not initialized");
+            return false;
+        };
+
+        let interner_arc = interner.bind().get_arc();
+        let interner_guard = interner_arc.read().unwrap();
+        let palette_bind = palette.bind();
+
+        let resolution = 1i32 << tree_bind.max_depth;
+
+        // Collect voxels
+        let mut voxels = Vec::new();
+        for x in 0..resolution {
+            for y in 0..resolution {
+                for z in 0..resolution {
+                    let pos = IVec3::new(x, y, z);
+                    if let Some(voxel_type) = vox_tree.get(&interner_guard, pos) {
+                        if voxel_type > 0 && voxel_type <= 255 {
+                            // Convert Y-up to Z-up for VOX format
+                            voxels.push((x as u8, z as u8, y as u8, voxel_type as u8));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build VOX file
+        let mut data = PackedByteArray::new();
+
+        // Magic number "VOX "
+        data.push(b'V');
+        data.push(b'O');
+        data.push(b'X');
+        data.push(b' ');
+
+        // Version 150
+        self.write_u32(&mut data, 150);
+
+        // MAIN chunk (contains all other chunks)
+        data.push(b'M');
+        data.push(b'A');
+        data.push(b'I');
+        data.push(b'N');
+        self.write_u32(&mut data, 0); // Main chunk has no content
+        // Children size will be updated later
+        let children_size_offset = data.len();
+        self.write_u32(&mut data, 0);
+
+        let children_start = data.len();
+
+        // SIZE chunk
+        data.push(b'S');
+        data.push(b'I');
+        data.push(b'Z');
+        data.push(b'E');
+        self.write_u32(&mut data, 12);
+        self.write_u32(&mut data, 0);
+        self.write_u32(&mut data, resolution as u32);
+        self.write_u32(&mut data, resolution as u32);
+        self.write_u32(&mut data, resolution as u32);
+
+        // XYZI chunk
+        data.push(b'X');
+        data.push(b'Y');
+        data.push(b'Z');
+        data.push(b'I');
+        self.write_u32(&mut data, 4 + voxels.len() as u32 * 4);
+        self.write_u32(&mut data, 0);
+        self.write_u32(&mut data, voxels.len() as u32);
+
+        for (x, y, z, color_index) in &voxels {
+            data.push(*x);
+            data.push(*y);
+            data.push(*z);
+            data.push(*color_index);
+        }
+
+        // RGBA chunk (palette)
+        data.push(b'R');
+        data.push(b'G');
+        data.push(b'B');
+        data.push(b'A');
+        self.write_u32(&mut data, 256 * 4);
+        self.write_u32(&mut data, 0);
+
+        for i in 0..256 {
+            let color = palette_bind
+                .types
+                .get(&(i as u16))
+                .map(|t| t.color)
+                .unwrap_or(Color::from_rgb(1.0, 0.0, 1.0));
+
+            data.push((color.r * 255.0) as u8);
+            data.push((color.g * 255.0) as u8);
+            data.push((color.b * 255.0) as u8);
+            data.push((color.a * 255.0) as u8);
+        }
+
+        // Update children size
+        let children_size = data.len() - children_start;
+        let children_size_bytes = (children_size as u32).to_le_bytes();
+        for (i, byte) in children_size_bytes.iter().enumerate() {
+            data[children_size_offset + i] = *byte;
+        }
+
+        // Write to file
+        let file_access = godot::classes::FileAccess::open(
+            &path,
+            godot::classes::file_access::ModeFlags::WRITE,
+        );
+
+        let Some(mut file) = file_access else {
+            godot_error!("Failed to create output file");
+            return false;
+        };
+
+        file.store_buffer(&data);
+        true
+    }
+
+    /// Write a little-endian u32 to the byte array
+    fn write_u32(&self, data: &mut PackedByteArray, value: u32) {
+        let bytes = value.to_le_bytes();
+        for byte in bytes {
+            data.push(byte);
+        }
+    }
 }
