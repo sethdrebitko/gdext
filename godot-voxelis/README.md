@@ -9,6 +9,8 @@ Godot bindings for the [Voxelis](https://github.com/WildPixelGames/voxelis) voxe
 - **Chunk-based World**: Built-in `VoxelWorld` class for managing large voxel worlds with automatic chunking
 - **Shape Primitives**: Helpers for drawing lines, boxes, and spheres
 - **Mesh Generation**: Built-in `VoxelMeshBuilder` for converting voxel data to renderable Godot meshes
+- **Asset System**: Create, save, load, and place reusable voxel structures with `VoxelAsset`
+- **Procedural Generation**: Built-in generators for trees, rocks, buildings, and more
 
 ## Classes
 
@@ -131,6 +133,77 @@ for chunk_pos in renderer.get_dirty_chunks():
     # Add mesh to scene...
 
 renderer.clear_dirty()
+```
+
+### VoxelAsset
+
+Reusable voxel structures that can be created, saved, loaded, and placed.
+
+```gdscript
+# Create an asset manually
+var asset = VoxelAsset.create()
+asset.set_name("My Structure")
+asset.set_voxel(Vector3i(0, 0, 0), 1)  # Base
+asset.set_voxel(Vector3i(0, 1, 0), 1)  # Middle
+asset.set_voxel(Vector3i(0, 2, 0), 2)  # Top
+
+# Shape primitives
+asset.fill_box(Vector3i(0, 0, 0), Vector3i(5, 3, 5), 1)
+asset.fill_sphere(Vector3i(2, 5, 2), 3, 2)
+asset.fill_cylinder(Vector3i(0, 0, 0), 2, 5, 1)
+
+# Transform the asset
+asset.center()       # Center around origin
+asset.ground()       # Move so minimum Y is 0
+asset.rotate_y_90()  # Rotate 90° around Y axis
+asset.mirror_x()     # Mirror along X axis
+
+# Place in world
+asset.place_in_world(interner, world, Vector3i(10, 0, 10))
+
+# Or place in a tree
+asset.place_in_tree(interner, tree, Vector3i(5, 5, 5))
+
+# Or use with batches for better performance
+asset.place_in_batch(interner, batch, Vector3i(20, 0, 20))
+tree.apply_batch(interner, batch)
+
+# Save/load assets
+var data = asset.to_dictionary()
+# Save data to file using Godot's FileAccess...
+
+var loaded_asset = VoxelAsset.from_dictionary(data)
+```
+
+### VoxelAssetGenerator
+
+Procedurally generate common voxel structures.
+
+```gdscript
+# Trees
+var tree = VoxelAssetGenerator.generate_tree(5, 3)        # trunk_height, canopy_radius
+var pine = VoxelAssetGenerator.generate_pine_tree(10)      # height
+
+# Natural features
+var rock = VoxelAssetGenerator.generate_rock(4)            # size
+var bush = VoxelAssetGenerator.generate_bush(2)            # size
+var cactus = VoxelAssetGenerator.generate_cactus(6)        # height
+
+# Buildings
+var house = VoxelAssetGenerator.generate_house(8, 6, 10)   # width, height, depth
+var wall = VoxelAssetGenerator.generate_wall(20, 4, 1)     # length, height, thickness
+var pillar = VoxelAssetGenerator.generate_pillar(8, 2)     # height, radius
+var stairs = VoxelAssetGenerator.generate_stairs(3, 8)     # width, steps
+
+# Decorations
+var fence = VoxelAssetGenerator.generate_fence(15, 3)      # length, height
+var flower_bed = VoxelAssetGenerator.generate_flower_bed(5, 5)  # width, depth
+var path = VoxelAssetGenerator.generate_path(20, 3)        # length, width
+
+# Place in world
+tree.place_in_world(interner, world, Vector3i(10, 0, 10))
+rock.place_in_world(interner, world, Vector3i(20, 0, 15))
+house.place_in_world(interner, world, Vector3i(30, 0, 20))
 ```
 
 ## Rendering Your Voxel World
@@ -356,6 +429,107 @@ func modify_voxel(world_pos: Vector3i, voxel_type: int):
     render_chunk(chunk_pos)
 ```
 
+## Creating Voxel Assets
+
+### Manual Asset Creation
+
+Create custom structures by setting voxels directly:
+
+```gdscript
+func create_lamp_post() -> VoxelAsset:
+    var asset = VoxelAsset.create()
+    asset.set_name("Lamp Post")
+    
+    # Pole
+    for y in range(5):
+        asset.set_voxel(Vector3i(0, y, 0), 11)  # Iron
+    
+    # Lamp head
+    asset.set_voxel(Vector3i(-1, 5, 0), 10)  # Gold
+    asset.set_voxel(Vector3i(1, 5, 0), 10)
+    asset.set_voxel(Vector3i(0, 5, -1), 10)
+    asset.set_voxel(Vector3i(0, 5, 1), 10)
+    asset.set_voxel(Vector3i(0, 6, 0), 10)
+    
+    return asset
+```
+
+### Asset Library Pattern
+
+Organize your assets in a library:
+
+```gdscript
+class_name VoxelAssetLibrary
+
+var assets: Dictionary = {}
+
+func _init():
+    # Load or generate assets
+    assets["tree_oak"] = VoxelAssetGenerator.generate_tree(6, 4)
+    assets["tree_pine"] = VoxelAssetGenerator.generate_pine_tree(12)
+    assets["rock_small"] = VoxelAssetGenerator.generate_rock(2)
+    assets["rock_large"] = VoxelAssetGenerator.generate_rock(5)
+    assets["house_small"] = VoxelAssetGenerator.generate_house(6, 5, 6)
+    assets["fence"] = VoxelAssetGenerator.generate_fence(10, 3)
+
+func get_asset(name: String) -> VoxelAsset:
+    if assets.has(name):
+        return assets[name].duplicate()  # Return a copy
+    return null
+
+func place(name: String, interner: VoxelInterner, world: VoxelWorld, pos: Vector3i):
+    var asset = get_asset(name)
+    if asset:
+        asset.place_in_world(interner, world, pos)
+```
+
+### Saving and Loading Assets
+
+```gdscript
+func save_asset(asset: VoxelAsset, path: String):
+    var data = asset.to_dictionary()
+    var file = FileAccess.open(path, FileAccess.WRITE)
+    file.store_var(data)
+    file.close()
+
+func load_asset(path: String) -> VoxelAsset:
+    var file = FileAccess.open(path, FileAccess.READ)
+    var data = file.get_var()
+    file.close()
+    return VoxelAsset.from_dictionary(data)
+```
+
+### Populating a World with Assets
+
+```gdscript
+func populate_world():
+    var library = VoxelAssetLibrary.new()
+    
+    # Scatter trees randomly
+    for i in range(50):
+        var pos = Vector3i(
+            randi_range(-100, 100),
+            0,
+            randi_range(-100, 100)
+        )
+        # Get ground height at this position...
+        var tree_type = "tree_oak" if randf() > 0.3 else "tree_pine"
+        library.place(tree_type, interner, world, pos)
+    
+    # Add some rocks
+    for i in range(30):
+        var pos = Vector3i(
+            randi_range(-100, 100),
+            0,
+            randi_range(-100, 100)
+        )
+        var rock_type = "rock_small" if randf() > 0.2 else "rock_large"
+        library.place(rock_type, interner, world, pos)
+    
+    # Place a house
+    library.place("house_small", interner, world, Vector3i(0, 0, 0))
+```
+
 ## Performance Tips
 
 1. **Use batches for bulk operations**: When modifying many voxels, use `VoxelBatch` instead of individual `set_voxel` calls
@@ -364,6 +538,7 @@ func modify_voxel(world_pos: Vector3i, voxel_type: int):
 4. **Fill operations are O(1)**: `tree.fill()` is nearly instant regardless of tree size due to octree compression
 5. **Only re-mesh dirty chunks**: Track which chunks have been modified and only regenerate their meshes
 6. **Use release builds**: Mesh generation is significantly faster in release mode
+7. **Use batches for placing assets**: When placing multiple assets, use `place_in_batch()` and apply once
 
 ## License
 

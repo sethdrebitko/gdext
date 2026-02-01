@@ -1325,3 +1325,1036 @@ impl VoxelChunkRenderer {
         )
     }
 }
+
+// ============================================================================
+// VoxelAsset - Reusable voxel structures/prefabs
+// ============================================================================
+
+/// A stored voxel entry with position and type.
+#[derive(Clone, Debug)]
+struct VoxelEntry {
+    x: i32,
+    y: i32,
+    z: i32,
+    voxel_type: u16,
+}
+
+/// A reusable voxel structure that can be placed in trees or worlds.
+///
+/// VoxelAsset stores a collection of voxels that can be saved, loaded,
+/// and placed multiple times. Use this for prefabs like trees, rocks,
+/// buildings, furniture, etc.
+///
+/// # Example
+/// ```gdscript
+/// # Create an asset manually
+/// var asset = VoxelAsset.new()
+/// asset.set_voxel(Vector3i(0, 0, 0), 1)  # Base
+/// asset.set_voxel(Vector3i(0, 1, 0), 1)  # Trunk
+/// asset.set_voxel(Vector3i(0, 2, 0), 2)  # Leaves
+///
+/// # Or generate procedurally
+/// var tree = VoxelAssetGenerator.generate_tree(5, 3)
+///
+/// # Place in world
+/// tree.place_in_world(interner, world, Vector3i(10, 0, 10))
+///
+/// # Save/load
+/// var data = asset.to_dictionary()
+/// var loaded = VoxelAsset.from_dictionary(data)
+/// ```
+#[derive(GodotClass)]
+#[class(base=RefCounted, init)]
+pub struct VoxelAsset {
+    /// Stored voxels
+    voxels: Vec<VoxelEntry>,
+    /// Asset name
+    name: GString,
+    /// Bounding box min
+    bounds_min: Vector3i,
+    /// Bounding box max
+    bounds_max: Vector3i,
+    /// Whether bounds need recalculation
+    bounds_dirty: bool,
+    base: Base<RefCounted>,
+}
+
+#[godot_api]
+impl VoxelAsset {
+    /// Creates a new empty VoxelAsset.
+    #[func]
+    pub fn create() -> Gd<Self> {
+        Gd::from_init_fn(|base| Self {
+            voxels: Vec::new(),
+            name: GString::new(),
+            bounds_min: Vector3i::ZERO,
+            bounds_max: Vector3i::ZERO,
+            bounds_dirty: true,
+            base,
+        })
+    }
+
+    /// Creates a new VoxelAsset with the given name.
+    #[func]
+    pub fn create_named(name: GString) -> Gd<Self> {
+        Gd::from_init_fn(|base| Self {
+            voxels: Vec::new(),
+            name,
+            bounds_min: Vector3i::ZERO,
+            bounds_max: Vector3i::ZERO,
+            bounds_dirty: true,
+            base,
+        })
+    }
+
+    /// Gets the asset name.
+    #[func]
+    pub fn get_name(&self) -> GString {
+        self.name.clone()
+    }
+
+    /// Sets the asset name.
+    #[func]
+    pub fn set_name(&mut self, name: GString) {
+        self.name = name;
+    }
+
+    /// Sets a voxel in the asset at the given local position.
+    #[func]
+    pub fn set_voxel(&mut self, position: Vector3i, voxel_type: i32) {
+        // Remove existing voxel at this position
+        self.voxels
+            .retain(|v| v.x != position.x || v.y != position.y || v.z != position.z);
+
+        // Add new voxel if not empty
+        if voxel_type > 0 {
+            self.voxels.push(VoxelEntry {
+                x: position.x,
+                y: position.y,
+                z: position.z,
+                voxel_type: voxel_type.clamp(0, 65535) as u16,
+            });
+        }
+
+        self.bounds_dirty = true;
+    }
+
+    /// Gets the voxel type at the given local position.
+    #[func]
+    pub fn get_voxel(&self, position: Vector3i) -> i32 {
+        for v in &self.voxels {
+            if v.x == position.x && v.y == position.y && v.z == position.z {
+                return v.voxel_type as i32;
+            }
+        }
+        0
+    }
+
+    /// Removes a voxel at the given position.
+    #[func]
+    pub fn remove_voxel(&mut self, position: Vector3i) {
+        self.voxels
+            .retain(|v| v.x != position.x || v.y != position.y || v.z != position.z);
+        self.bounds_dirty = true;
+    }
+
+    /// Clears all voxels from the asset.
+    #[func]
+    pub fn clear(&mut self) {
+        self.voxels.clear();
+        self.bounds_dirty = true;
+    }
+
+    /// Returns the number of voxels in the asset.
+    #[func]
+    pub fn get_voxel_count(&self) -> i32 {
+        self.voxels.len() as i32
+    }
+
+    /// Returns whether the asset is empty.
+    #[func]
+    pub fn is_empty(&self) -> bool {
+        self.voxels.is_empty()
+    }
+
+    /// Recalculates the bounding box.
+    fn recalculate_bounds(&mut self) {
+        if !self.bounds_dirty {
+            return;
+        }
+
+        if self.voxels.is_empty() {
+            self.bounds_min = Vector3i::ZERO;
+            self.bounds_max = Vector3i::ZERO;
+        } else {
+            let mut min_x = i32::MAX;
+            let mut min_y = i32::MAX;
+            let mut min_z = i32::MAX;
+            let mut max_x = i32::MIN;
+            let mut max_y = i32::MIN;
+            let mut max_z = i32::MIN;
+
+            for v in &self.voxels {
+                min_x = min_x.min(v.x);
+                min_y = min_y.min(v.y);
+                min_z = min_z.min(v.z);
+                max_x = max_x.max(v.x);
+                max_y = max_y.max(v.y);
+                max_z = max_z.max(v.z);
+            }
+
+            self.bounds_min = Vector3i::new(min_x, min_y, min_z);
+            self.bounds_max = Vector3i::new(max_x, max_y, max_z);
+        }
+
+        self.bounds_dirty = false;
+    }
+
+    /// Gets the minimum corner of the bounding box.
+    #[func]
+    pub fn get_bounds_min(&mut self) -> Vector3i {
+        self.recalculate_bounds();
+        self.bounds_min
+    }
+
+    /// Gets the maximum corner of the bounding box.
+    #[func]
+    pub fn get_bounds_max(&mut self) -> Vector3i {
+        self.recalculate_bounds();
+        self.bounds_max
+    }
+
+    /// Gets the size of the asset (max - min + 1).
+    #[func]
+    pub fn get_size(&mut self) -> Vector3i {
+        self.recalculate_bounds();
+        if self.voxels.is_empty() {
+            Vector3i::ZERO
+        } else {
+            Vector3i::new(
+                self.bounds_max.x - self.bounds_min.x + 1,
+                self.bounds_max.y - self.bounds_min.y + 1,
+                self.bounds_max.z - self.bounds_min.z + 1,
+            )
+        }
+    }
+
+    /// Centers the asset around the origin (0, 0, 0).
+    #[func]
+    pub fn center(&mut self) {
+        self.recalculate_bounds();
+        if self.voxels.is_empty() {
+            return;
+        }
+
+        let center_x = (self.bounds_min.x + self.bounds_max.x) / 2;
+        let center_z = (self.bounds_min.z + self.bounds_max.z) / 2;
+
+        for v in &mut self.voxels {
+            v.x -= center_x;
+            v.z -= center_z;
+        }
+
+        self.bounds_dirty = true;
+    }
+
+    /// Moves the asset so its minimum Y is at the origin.
+    #[func]
+    pub fn ground(&mut self) {
+        self.recalculate_bounds();
+        if self.voxels.is_empty() {
+            return;
+        }
+
+        let min_y = self.bounds_min.y;
+        for v in &mut self.voxels {
+            v.y -= min_y;
+        }
+
+        self.bounds_dirty = true;
+    }
+
+    /// Translates all voxels by the given offset.
+    #[func]
+    pub fn translate(&mut self, offset: Vector3i) {
+        for v in &mut self.voxels {
+            v.x += offset.x;
+            v.y += offset.y;
+            v.z += offset.z;
+        }
+        self.bounds_dirty = true;
+    }
+
+    /// Rotates the asset 90 degrees around the Y axis.
+    #[func]
+    pub fn rotate_y_90(&mut self) {
+        for v in &mut self.voxels {
+            let old_x = v.x;
+            v.x = -v.z;
+            v.z = old_x;
+        }
+        self.bounds_dirty = true;
+    }
+
+    /// Rotates the asset 180 degrees around the Y axis.
+    #[func]
+    pub fn rotate_y_180(&mut self) {
+        for v in &mut self.voxels {
+            v.x = -v.x;
+            v.z = -v.z;
+        }
+        self.bounds_dirty = true;
+    }
+
+    /// Rotates the asset 270 degrees around the Y axis.
+    #[func]
+    pub fn rotate_y_270(&mut self) {
+        for v in &mut self.voxels {
+            let old_x = v.x;
+            v.x = v.z;
+            v.z = -old_x;
+        }
+        self.bounds_dirty = true;
+    }
+
+    /// Mirrors the asset along the X axis.
+    #[func]
+    pub fn mirror_x(&mut self) {
+        for v in &mut self.voxels {
+            v.x = -v.x;
+        }
+        self.bounds_dirty = true;
+    }
+
+    /// Mirrors the asset along the Z axis.
+    #[func]
+    pub fn mirror_z(&mut self) {
+        for v in &mut self.voxels {
+            v.z = -v.z;
+        }
+        self.bounds_dirty = true;
+    }
+
+    /// Places the asset into a VoxelTree at the given position.
+    ///
+    /// # Arguments
+    /// * `interner` - The VoxelInterner managing memory
+    /// * `tree` - The target VoxelTree
+    /// * `position` - The position to place the asset (added to each voxel's local position)
+    #[func]
+    pub fn place_in_tree(
+        &self,
+        interner: Gd<VoxelInterner>,
+        mut tree: Gd<VoxelTree>,
+        position: Vector3i,
+    ) {
+        let mut tree_bind = tree.bind_mut();
+        let max_depth = tree_bind.max_depth;
+        let Some(ref mut vox_tree) = tree_bind.tree else {
+            godot_error!("VoxelAsset::place_in_tree: VoxelTree not initialized");
+            return;
+        };
+
+        let interner_arc = interner.bind().get_arc();
+        let mut interner_guard = interner_arc.write().unwrap();
+
+        let max = 1 << max_depth;
+        for v in &self.voxels {
+            let pos = IVec3::new(position.x + v.x, position.y + v.y, position.z + v.z);
+
+            if pos.x >= 0 && pos.x < max && pos.y >= 0 && pos.y < max && pos.z >= 0 && pos.z < max {
+                vox_tree.set(&mut interner_guard, pos, v.voxel_type);
+            }
+        }
+    }
+
+    /// Places the asset into a VoxelWorld at the given world position.
+    ///
+    /// # Arguments
+    /// * `interner` - The VoxelInterner managing memory
+    /// * `world` - The target VoxelWorld
+    /// * `position` - The world position to place the asset
+    #[func]
+    pub fn place_in_world(
+        &self,
+        interner: Gd<VoxelInterner>,
+        mut world: Gd<VoxelWorld>,
+        position: Vector3i,
+    ) {
+        for v in &self.voxels {
+            let world_pos = Vector3i::new(position.x + v.x, position.y + v.y, position.z + v.z);
+            world
+                .bind_mut()
+                .set_voxel(interner.clone(), world_pos, v.voxel_type as i32);
+        }
+    }
+
+    /// Places the asset using a VoxelBatch for better performance.
+    ///
+    /// # Arguments
+    /// * `interner` - The VoxelInterner managing memory
+    /// * `batch` - The batch to add operations to
+    /// * `position` - The position to place the asset
+    #[func]
+    pub fn place_in_batch(
+        &self,
+        interner: Gd<VoxelInterner>,
+        mut batch: Gd<VoxelBatch>,
+        position: Vector3i,
+    ) {
+        for v in &self.voxels {
+            let pos = Vector3i::new(position.x + v.x, position.y + v.y, position.z + v.z);
+            batch
+                .bind_mut()
+                .set_voxel(interner.clone(), pos, v.voxel_type as i32);
+        }
+    }
+
+    /// Converts the asset to a Dictionary for serialization.
+    #[func]
+    pub fn to_dictionary(&mut self) -> VarDictionary {
+        self.recalculate_bounds();
+
+        let mut dict = VarDictionary::new();
+        dict.set("name", self.name.clone());
+        dict.set("version", 1i32);
+
+        // Store voxels as packed arrays for efficiency
+        let mut positions = PackedInt32Array::new();
+        let mut types = PackedInt32Array::new();
+
+        for v in &self.voxels {
+            positions.push(v.x);
+            positions.push(v.y);
+            positions.push(v.z);
+            types.push(v.voxel_type as i32);
+        }
+
+        dict.set("positions", positions);
+        dict.set("types", types);
+        dict.set("bounds_min", self.bounds_min);
+        dict.set("bounds_max", self.bounds_max);
+
+        dict
+    }
+
+    /// Creates a VoxelAsset from a Dictionary.
+    #[func]
+    pub fn from_dictionary(dict: VarDictionary) -> Option<Gd<Self>> {
+        let name: GString = dict.get("name")?.to();
+        let positions: PackedInt32Array = dict.get("positions")?.to();
+        let types: PackedInt32Array = dict.get("types")?.to();
+
+        if positions.len() % 3 != 0 || positions.len() / 3 != types.len() {
+            godot_error!("VoxelAsset::from_dictionary: Invalid data format");
+            return None;
+        }
+
+        let mut voxels = Vec::new();
+        for i in 0..types.len() {
+            voxels.push(VoxelEntry {
+                x: positions[i * 3],
+                y: positions[i * 3 + 1],
+                z: positions[i * 3 + 2],
+                voxel_type: types[i].clamp(0, 65535) as u16,
+            });
+        }
+
+        Some(Gd::from_init_fn(|base| Self {
+            voxels,
+            name,
+            bounds_min: Vector3i::ZERO,
+            bounds_max: Vector3i::ZERO,
+            bounds_dirty: true,
+            base,
+        }))
+    }
+
+    /// Creates a copy of this asset.
+    #[func]
+    pub fn duplicate(&self) -> Gd<Self> {
+        Gd::from_init_fn(|base| Self {
+            voxels: self.voxels.clone(),
+            name: self.name.clone(),
+            bounds_min: self.bounds_min,
+            bounds_max: self.bounds_max,
+            bounds_dirty: self.bounds_dirty,
+            base,
+        })
+    }
+
+    /// Gets all voxel positions as an array.
+    #[func]
+    pub fn get_positions(&self) -> Array<Vector3i> {
+        let mut arr = Array::new();
+        for v in &self.voxels {
+            arr.push(Vector3i::new(v.x, v.y, v.z));
+        }
+        arr
+    }
+
+    /// Fills a box region with a voxel type.
+    #[func]
+    pub fn fill_box(&mut self, min_corner: Vector3i, max_corner: Vector3i, voxel_type: i32) {
+        let min_x = min_corner.x.min(max_corner.x);
+        let max_x = min_corner.x.max(max_corner.x);
+        let min_y = min_corner.y.min(max_corner.y);
+        let max_y = min_corner.y.max(max_corner.y);
+        let min_z = min_corner.z.min(max_corner.z);
+        let max_z = min_corner.z.max(max_corner.z);
+
+        for x in min_x..=max_x {
+            for y in min_y..=max_y {
+                for z in min_z..=max_z {
+                    self.set_voxel(Vector3i::new(x, y, z), voxel_type);
+                }
+            }
+        }
+    }
+
+    /// Fills a sphere region with a voxel type.
+    #[func]
+    pub fn fill_sphere(&mut self, center: Vector3i, radius: i32, voxel_type: i32) {
+        let radius_sq = radius * radius;
+
+        for x in (center.x - radius)..=(center.x + radius) {
+            for y in (center.y - radius)..=(center.y + radius) {
+                for z in (center.z - radius)..=(center.z + radius) {
+                    let dx = x - center.x;
+                    let dy = y - center.y;
+                    let dz = z - center.z;
+                    let dist_sq = dx * dx + dy * dy + dz * dz;
+
+                    if dist_sq <= radius_sq {
+                        self.set_voxel(Vector3i::new(x, y, z), voxel_type);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fills a cylinder region with a voxel type.
+    #[func]
+    pub fn fill_cylinder(
+        &mut self,
+        base_center: Vector3i,
+        radius: i32,
+        height: i32,
+        voxel_type: i32,
+    ) {
+        let radius_sq = radius * radius;
+
+        for y in 0..height {
+            for x in (base_center.x - radius)..=(base_center.x + radius) {
+                for z in (base_center.z - radius)..=(base_center.z + radius) {
+                    let dx = x - base_center.x;
+                    let dz = z - base_center.z;
+                    let dist_sq = dx * dx + dz * dz;
+
+                    if dist_sq <= radius_sq {
+                        self.set_voxel(Vector3i::new(x, base_center.y + y, z), voxel_type);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// VoxelAssetGenerator - Procedural asset generation
+// ============================================================================
+
+/// Procedural generator for common voxel assets.
+///
+/// Use this to quickly create trees, rocks, buildings, and other
+/// common structures.
+///
+/// # Example
+/// ```gdscript
+/// # Generate a tree
+/// var tree = VoxelAssetGenerator.generate_tree(5, 3)
+/// tree.place_in_world(interner, world, Vector3i(10, 0, 10))
+///
+/// # Generate a rock
+/// var rock = VoxelAssetGenerator.generate_rock(3)
+/// rock.place_in_world(interner, world, Vector3i(20, 0, 15))
+///
+/// # Generate a simple house
+/// var house = VoxelAssetGenerator.generate_house(8, 6, 8)
+/// house.place_in_world(interner, world, Vector3i(30, 0, 20))
+/// ```
+#[derive(GodotClass)]
+#[class(base=RefCounted, init)]
+pub struct VoxelAssetGenerator {
+    base: Base<RefCounted>,
+}
+
+#[godot_api]
+impl VoxelAssetGenerator {
+    // Voxel type constants for generated assets
+    // These match the default color palette in VoxelMeshBuilder
+    const STONE: i32 = 1;
+    const DIRT: i32 = 2;
+    const GRASS: i32 = 3;
+    const WOOD: i32 = 6;
+    const LEAVES: i32 = 7;
+
+    /// Generates a simple tree asset.
+    ///
+    /// # Arguments
+    /// * `trunk_height` - Height of the trunk (3-20)
+    /// * `canopy_radius` - Radius of the leaf canopy (2-10)
+    ///
+    /// # Returns
+    /// A VoxelAsset containing the tree, centered at base.
+    #[func]
+    pub fn generate_tree(trunk_height: i32, canopy_radius: i32) -> Gd<VoxelAsset> {
+        let trunk_height = trunk_height.clamp(3, 20);
+        let canopy_radius = canopy_radius.clamp(2, 10);
+
+        let mut asset = VoxelAsset::create();
+        let mut asset_bind = asset.bind_mut();
+        asset_bind.set_name("Tree".into());
+
+        // Generate trunk
+        for y in 0..trunk_height {
+            asset_bind.set_voxel(Vector3i::new(0, y, 0), Self::WOOD);
+        }
+
+        // Generate canopy (sphere of leaves)
+        let canopy_center_y = trunk_height + canopy_radius / 2;
+        let radius_sq = canopy_radius * canopy_radius;
+
+        for x in -canopy_radius..=canopy_radius {
+            for y in -canopy_radius..=canopy_radius {
+                for z in -canopy_radius..=canopy_radius {
+                    let dist_sq = x * x + y * y + z * z;
+                    if dist_sq <= radius_sq {
+                        let pos = Vector3i::new(x, canopy_center_y + y, z);
+                        // Don't overwrite trunk
+                        if !(x == 0 && z == 0 && pos.y < trunk_height) {
+                            asset_bind.set_voxel(pos, Self::LEAVES);
+                        }
+                    }
+                }
+            }
+        }
+
+        drop(asset_bind);
+        asset
+    }
+
+    /// Generates a pine tree asset.
+    ///
+    /// # Arguments
+    /// * `height` - Total height of the tree (5-30)
+    ///
+    /// # Returns
+    /// A VoxelAsset containing the pine tree.
+    #[func]
+    pub fn generate_pine_tree(height: i32) -> Gd<VoxelAsset> {
+        let height = height.clamp(5, 30);
+
+        let mut asset = VoxelAsset::create();
+        let mut asset_bind = asset.bind_mut();
+        asset_bind.set_name("Pine Tree".into());
+
+        // Generate trunk
+        let trunk_height = height * 2 / 3;
+        for y in 0..trunk_height {
+            asset_bind.set_voxel(Vector3i::new(0, y, 0), Self::WOOD);
+        }
+
+        // Generate conical canopy
+        let canopy_start = height / 4;
+        let canopy_height = height - canopy_start;
+
+        for y in 0..canopy_height {
+            let layer_y = canopy_start + y;
+            let progress = y as f32 / canopy_height as f32;
+            let radius = ((1.0 - progress) * (height as f32 / 4.0)).ceil() as i32;
+
+            for x in -radius..=radius {
+                for z in -radius..=radius {
+                    let dist_sq = x * x + z * z;
+                    if dist_sq <= radius * radius {
+                        if !(x == 0 && z == 0 && layer_y < trunk_height) {
+                            asset_bind.set_voxel(Vector3i::new(x, layer_y, z), Self::LEAVES);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Top of tree
+        asset_bind.set_voxel(Vector3i::new(0, height - 1, 0), Self::LEAVES);
+        asset_bind.set_voxel(Vector3i::new(0, height, 0), Self::LEAVES);
+
+        drop(asset_bind);
+        asset
+    }
+
+    /// Generates a rock/boulder asset.
+    ///
+    /// # Arguments
+    /// * `size` - Approximate size of the rock (2-10)
+    ///
+    /// # Returns
+    /// A VoxelAsset containing the rock.
+    #[func]
+    pub fn generate_rock(size: i32) -> Gd<VoxelAsset> {
+        let size = size.clamp(2, 10);
+
+        let mut asset = VoxelAsset::create();
+        let mut asset_bind = asset.bind_mut();
+        asset_bind.set_name("Rock".into());
+
+        // Generate an irregular rock shape using multiple overlapping spheres
+        let main_radius = size;
+        let radius_sq = main_radius * main_radius;
+
+        for x in -main_radius..=main_radius {
+            for y in 0..=main_radius {
+                for z in -main_radius..=main_radius {
+                    let dist_sq = x * x + (y * 3 / 2) * (y * 3 / 2) + z * z;
+                    if dist_sq <= radius_sq {
+                        asset_bind.set_voxel(Vector3i::new(x, y, z), Self::STONE);
+                    }
+                }
+            }
+        }
+
+        drop(asset_bind);
+        asset
+    }
+
+    /// Generates a simple house/building asset.
+    ///
+    /// # Arguments
+    /// * `width` - Width of the house (X axis, 4-20)
+    /// * `height` - Height to the roof base (4-15)
+    /// * `depth` - Depth of the house (Z axis, 4-20)
+    ///
+    /// # Returns
+    /// A VoxelAsset containing the house.
+    #[func]
+    pub fn generate_house(width: i32, height: i32, depth: i32) -> Gd<VoxelAsset> {
+        let width = width.clamp(4, 20);
+        let height = height.clamp(4, 15);
+        let depth = depth.clamp(4, 20);
+
+        let mut asset = VoxelAsset::create();
+        let mut asset_bind = asset.bind_mut();
+        asset_bind.set_name("House".into());
+
+        // Generate walls
+        for y in 0..height {
+            for x in 0..width {
+                for z in 0..depth {
+                    let is_wall =
+                        x == 0 || x == width - 1 || z == 0 || z == depth - 1 || y == 0;
+                    if is_wall {
+                        asset_bind.set_voxel(Vector3i::new(x, y, z), Self::STONE);
+                    }
+                }
+            }
+        }
+
+        // Add door (front wall, centered)
+        let door_x = width / 2;
+        asset_bind.set_voxel(Vector3i::new(door_x, 1, 0), 0);
+        asset_bind.set_voxel(Vector3i::new(door_x, 2, 0), 0);
+
+        // Add windows
+        if width > 6 {
+            let window_y = height / 2;
+            // Front windows
+            asset_bind.set_voxel(Vector3i::new(2, window_y, 0), 0);
+            asset_bind.set_voxel(Vector3i::new(width - 3, window_y, 0), 0);
+            // Back windows
+            asset_bind.set_voxel(Vector3i::new(2, window_y, depth - 1), 0);
+            asset_bind.set_voxel(Vector3i::new(width - 3, window_y, depth - 1), 0);
+        }
+
+        // Generate simple roof
+        for y in 0..=(width / 2) {
+            for z in -1..=depth {
+                let roof_y = height + y;
+                asset_bind.set_voxel(Vector3i::new(y, roof_y, z), Self::WOOD);
+                asset_bind.set_voxel(Vector3i::new(width - 1 - y, roof_y, z), Self::WOOD);
+            }
+        }
+
+        // Center the house
+        drop(asset_bind);
+        let mut asset_bind = asset.bind_mut();
+        asset_bind.translate(Vector3i::new(-width / 2, 0, -depth / 2));
+
+        drop(asset_bind);
+        asset
+    }
+
+    /// Generates a wall segment.
+    ///
+    /// # Arguments
+    /// * `length` - Length of the wall
+    /// * `height` - Height of the wall
+    /// * `thickness` - Thickness of the wall (1-3)
+    ///
+    /// # Returns
+    /// A VoxelAsset containing the wall, aligned along the X axis.
+    #[func]
+    pub fn generate_wall(length: i32, height: i32, thickness: i32) -> Gd<VoxelAsset> {
+        let length = length.clamp(1, 100);
+        let height = height.clamp(1, 50);
+        let thickness = thickness.clamp(1, 3);
+
+        let mut asset = VoxelAsset::create();
+        let mut asset_bind = asset.bind_mut();
+        asset_bind.set_name("Wall".into());
+
+        for x in 0..length {
+            for y in 0..height {
+                for z in 0..thickness {
+                    asset_bind.set_voxel(Vector3i::new(x, y, z), Self::STONE);
+                }
+            }
+        }
+
+        drop(asset_bind);
+        asset
+    }
+
+    /// Generates a pillar/column.
+    ///
+    /// # Arguments
+    /// * `height` - Height of the pillar
+    /// * `radius` - Radius of the pillar (1-5)
+    ///
+    /// # Returns
+    /// A VoxelAsset containing the pillar.
+    #[func]
+    pub fn generate_pillar(height: i32, radius: i32) -> Gd<VoxelAsset> {
+        let height = height.clamp(1, 50);
+        let radius = radius.clamp(1, 5);
+
+        let mut asset = VoxelAsset::create();
+        let mut asset_bind = asset.bind_mut();
+        asset_bind.set_name("Pillar".into());
+
+        asset_bind.fill_cylinder(Vector3i::ZERO, radius, height, Self::STONE);
+
+        drop(asset_bind);
+        asset
+    }
+
+    /// Generates a staircase.
+    ///
+    /// # Arguments
+    /// * `width` - Width of the stairs
+    /// * `steps` - Number of steps
+    ///
+    /// # Returns
+    /// A VoxelAsset containing the stairs, going up in +X direction.
+    #[func]
+    pub fn generate_stairs(width: i32, steps: i32) -> Gd<VoxelAsset> {
+        let width = width.clamp(1, 10);
+        let steps = steps.clamp(1, 20);
+
+        let mut asset = VoxelAsset::create();
+        let mut asset_bind = asset.bind_mut();
+        asset_bind.set_name("Stairs".into());
+
+        for step in 0..steps {
+            for z in 0..width {
+                // Each step is 1 block high and 1 block deep
+                for fill_y in 0..=step {
+                    asset_bind.set_voxel(Vector3i::new(step, fill_y, z), Self::STONE);
+                }
+            }
+        }
+
+        drop(asset_bind);
+        asset
+    }
+
+    /// Generates a fence segment.
+    ///
+    /// # Arguments
+    /// * `length` - Length of the fence
+    /// * `height` - Height of the fence posts (2-5)
+    ///
+    /// # Returns
+    /// A VoxelAsset containing the fence.
+    #[func]
+    pub fn generate_fence(length: i32, height: i32) -> Gd<VoxelAsset> {
+        let length = length.clamp(1, 50);
+        let height = height.clamp(2, 5);
+
+        let mut asset = VoxelAsset::create();
+        let mut asset_bind = asset.bind_mut();
+        asset_bind.set_name("Fence".into());
+
+        // Posts every 3 blocks
+        for x in (0..length).step_by(3) {
+            for y in 0..height {
+                asset_bind.set_voxel(Vector3i::new(x, y, 0), Self::WOOD);
+            }
+        }
+        // End post
+        for y in 0..height {
+            asset_bind.set_voxel(Vector3i::new(length - 1, y, 0), Self::WOOD);
+        }
+
+        // Horizontal rails
+        let rail_y = height / 2;
+        for x in 0..length {
+            asset_bind.set_voxel(Vector3i::new(x, rail_y, 0), Self::WOOD);
+            asset_bind.set_voxel(Vector3i::new(x, height - 1, 0), Self::WOOD);
+        }
+
+        drop(asset_bind);
+        asset
+    }
+
+    /// Generates a bush/shrub.
+    ///
+    /// # Arguments
+    /// * `size` - Size of the bush (1-5)
+    ///
+    /// # Returns
+    /// A VoxelAsset containing the bush.
+    #[func]
+    pub fn generate_bush(size: i32) -> Gd<VoxelAsset> {
+        let size = size.clamp(1, 5);
+
+        let mut asset = VoxelAsset::create();
+        let mut asset_bind = asset.bind_mut();
+        asset_bind.set_name("Bush".into());
+
+        // Slightly flattened sphere
+        let radius_sq = size * size;
+        for x in -size..=size {
+            for y in 0..=size {
+                for z in -size..=size {
+                    let dist_sq = x * x + (y * 2) * (y * 2) + z * z;
+                    if dist_sq <= radius_sq {
+                        asset_bind.set_voxel(Vector3i::new(x, y, z), Self::LEAVES);
+                    }
+                }
+            }
+        }
+
+        drop(asset_bind);
+        asset
+    }
+
+    /// Generates a cactus.
+    ///
+    /// # Arguments
+    /// * `height` - Height of the cactus (3-15)
+    ///
+    /// # Returns
+    /// A VoxelAsset containing the cactus.
+    #[func]
+    pub fn generate_cactus(height: i32) -> Gd<VoxelAsset> {
+        let height = height.clamp(3, 15);
+
+        let mut asset = VoxelAsset::create();
+        let mut asset_bind = asset.bind_mut();
+        asset_bind.set_name("Cactus".into());
+
+        // Main stem
+        for y in 0..height {
+            asset_bind.set_voxel(Vector3i::new(0, y, 0), Self::GRASS);
+        }
+
+        // Arms (if tall enough)
+        if height >= 5 {
+            let arm_y = height / 2;
+            // Left arm
+            asset_bind.set_voxel(Vector3i::new(-1, arm_y, 0), Self::GRASS);
+            asset_bind.set_voxel(Vector3i::new(-1, arm_y + 1, 0), Self::GRASS);
+            asset_bind.set_voxel(Vector3i::new(-1, arm_y + 2, 0), Self::GRASS);
+
+            // Right arm (slightly higher)
+            let arm_y2 = arm_y + 2;
+            if arm_y2 + 2 < height {
+                asset_bind.set_voxel(Vector3i::new(1, arm_y2, 0), Self::GRASS);
+                asset_bind.set_voxel(Vector3i::new(1, arm_y2 + 1, 0), Self::GRASS);
+                asset_bind.set_voxel(Vector3i::new(1, arm_y2 + 2, 0), Self::GRASS);
+            }
+        }
+
+        drop(asset_bind);
+        asset
+    }
+
+    /// Generates a flower bed with dirt base.
+    ///
+    /// # Arguments
+    /// * `width` - Width of the bed
+    /// * `depth` - Depth of the bed
+    ///
+    /// # Returns
+    /// A VoxelAsset containing the flower bed.
+    #[func]
+    pub fn generate_flower_bed(width: i32, depth: i32) -> Gd<VoxelAsset> {
+        let width = width.clamp(2, 20);
+        let depth = depth.clamp(2, 20);
+
+        let mut asset = VoxelAsset::create();
+        let mut asset_bind = asset.bind_mut();
+        asset_bind.set_name("Flower Bed".into());
+
+        // Dirt base
+        for x in 0..width {
+            for z in 0..depth {
+                asset_bind.set_voxel(Vector3i::new(x, 0, z), Self::DIRT);
+            }
+        }
+
+        // Some flowers on top (using leaves color as placeholder)
+        for x in (1..width - 1).step_by(2) {
+            for z in (1..depth - 1).step_by(2) {
+                asset_bind.set_voxel(Vector3i::new(x, 1, z), Self::LEAVES);
+            }
+        }
+
+        // Center the bed
+        drop(asset_bind);
+        let mut asset_bind = asset.bind_mut();
+        asset_bind.translate(Vector3i::new(-width / 2, 0, -depth / 2));
+
+        drop(asset_bind);
+        asset
+    }
+
+    /// Generates a path segment.
+    ///
+    /// # Arguments
+    /// * `length` - Length of the path
+    /// * `width` - Width of the path (1-5)
+    ///
+    /// # Returns
+    /// A VoxelAsset containing the path along the X axis.
+    #[func]
+    pub fn generate_path(length: i32, width: i32) -> Gd<VoxelAsset> {
+        let length = length.clamp(1, 100);
+        let width = width.clamp(1, 5);
+
+        let mut asset = VoxelAsset::create();
+        let mut asset_bind = asset.bind_mut();
+        asset_bind.set_name("Path".into());
+
+        let half_width = width / 2;
+        for x in 0..length {
+            for z in -half_width..=(width - half_width - 1) {
+                asset_bind.set_voxel(Vector3i::new(x, 0, z), Self::DIRT);
+            }
+        }
+
+        drop(asset_bind);
+        asset
+    }
+}
