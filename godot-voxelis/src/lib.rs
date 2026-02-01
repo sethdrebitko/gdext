@@ -20,11 +20,22 @@
 //! batch.set_voxel(interner, Vector3i(0, 0, 0), 1)
 //! batch.set_voxel(interner, Vector3i(1, 1, 1), 2)
 //! tree.apply_batch(interner, batch)
+//!
+//! # Rendering - Generate meshes from voxel data
+//! var mesh_builder = VoxelMeshBuilder.new()
+//! var mesh = mesh_builder.build_mesh(interner, tree)
+//! var mesh_instance = MeshInstance3D.new()
+//! mesh_instance.mesh = mesh
+//! add_child(mesh_instance)
 //! ```
 
 use std::sync::{Arc, RwLock};
 
 use glam::IVec3;
+use godot::builtin::varray;
+use godot::classes::mesh::{ArrayType, PrimitiveType};
+use godot::classes::ArrayMesh;
+use godot::obj::{EngineEnum, NewGd};
 use godot::prelude::*;
 
 use voxelis::spatial::{VoxOpsBatch, VoxOpsBulkWrite, VoxOpsRead, VoxOpsWrite, VoxTree};
@@ -675,5 +686,642 @@ impl VoxelWorld {
             arr.push(Vector3i::new(*x, *y, *z));
         }
         arr
+    }
+}
+
+// ============================================================================
+// VoxelMeshBuilder - Converts voxel data to renderable meshes
+// ============================================================================
+
+/// Face direction for voxel mesh generation.
+#[derive(Clone, Copy, Debug)]
+enum VoxelFace {
+    /// +X direction (right)
+    Right,
+    /// -X direction (left)
+    Left,
+    /// +Y direction (up)
+    Top,
+    /// -Y direction (down)
+    Bottom,
+    /// +Z direction (front)
+    Front,
+    /// -Z direction (back)
+    Back,
+}
+
+impl VoxelFace {
+    /// Returns the normal vector for this face.
+    fn normal(&self) -> Vector3 {
+        match self {
+            VoxelFace::Right => Vector3::new(1.0, 0.0, 0.0),
+            VoxelFace::Left => Vector3::new(-1.0, 0.0, 0.0),
+            VoxelFace::Top => Vector3::new(0.0, 1.0, 0.0),
+            VoxelFace::Bottom => Vector3::new(0.0, -1.0, 0.0),
+            VoxelFace::Front => Vector3::new(0.0, 0.0, 1.0),
+            VoxelFace::Back => Vector3::new(0.0, 0.0, -1.0),
+        }
+    }
+
+    /// Returns the offset to check for neighbor in this direction.
+    fn offset(&self) -> IVec3 {
+        match self {
+            VoxelFace::Right => IVec3::new(1, 0, 0),
+            VoxelFace::Left => IVec3::new(-1, 0, 0),
+            VoxelFace::Top => IVec3::new(0, 1, 0),
+            VoxelFace::Bottom => IVec3::new(0, -1, 0),
+            VoxelFace::Front => IVec3::new(0, 0, 1),
+            VoxelFace::Back => IVec3::new(0, 0, -1),
+        }
+    }
+
+    /// Returns the 4 vertices for this face (counter-clockwise when viewed from outside).
+    fn vertices(&self, pos: Vector3, size: f32) -> [Vector3; 4] {
+        let s = size;
+        match self {
+            VoxelFace::Right => [
+                pos + Vector3::new(s, 0.0, 0.0),
+                pos + Vector3::new(s, 0.0, s),
+                pos + Vector3::new(s, s, s),
+                pos + Vector3::new(s, s, 0.0),
+            ],
+            VoxelFace::Left => [
+                pos + Vector3::new(0.0, 0.0, s),
+                pos + Vector3::new(0.0, 0.0, 0.0),
+                pos + Vector3::new(0.0, s, 0.0),
+                pos + Vector3::new(0.0, s, s),
+            ],
+            VoxelFace::Top => [
+                pos + Vector3::new(0.0, s, 0.0),
+                pos + Vector3::new(s, s, 0.0),
+                pos + Vector3::new(s, s, s),
+                pos + Vector3::new(0.0, s, s),
+            ],
+            VoxelFace::Bottom => [
+                pos + Vector3::new(0.0, 0.0, s),
+                pos + Vector3::new(s, 0.0, s),
+                pos + Vector3::new(s, 0.0, 0.0),
+                pos + Vector3::new(0.0, 0.0, 0.0),
+            ],
+            VoxelFace::Front => [
+                pos + Vector3::new(s, 0.0, s),
+                pos + Vector3::new(0.0, 0.0, s),
+                pos + Vector3::new(0.0, s, s),
+                pos + Vector3::new(s, s, s),
+            ],
+            VoxelFace::Back => [
+                pos + Vector3::new(0.0, 0.0, 0.0),
+                pos + Vector3::new(s, 0.0, 0.0),
+                pos + Vector3::new(s, s, 0.0),
+                pos + Vector3::new(0.0, s, 0.0),
+            ],
+        }
+    }
+
+    /// Returns UV coordinates for this face.
+    fn uvs(&self) -> [Vector2; 4] {
+        [
+            Vector2::new(0.0, 1.0),
+            Vector2::new(1.0, 1.0),
+            Vector2::new(1.0, 0.0),
+            Vector2::new(0.0, 0.0),
+        ]
+    }
+}
+
+const ALL_FACES: [VoxelFace; 6] = [
+    VoxelFace::Right,
+    VoxelFace::Left,
+    VoxelFace::Top,
+    VoxelFace::Bottom,
+    VoxelFace::Front,
+    VoxelFace::Back,
+];
+
+/// Builder for converting voxel data into renderable Godot meshes.
+///
+/// VoxelMeshBuilder generates optimized meshes from VoxelTree data by only
+/// creating faces for voxels that are visible (not completely surrounded by
+/// other solid voxels).
+///
+/// # Example
+/// ```gdscript
+/// var mesh_builder = VoxelMeshBuilder.new()
+/// mesh_builder.set_voxel_size(1.0)
+///
+/// # Build mesh from a VoxelTree
+/// var mesh = mesh_builder.build_mesh(interner, tree)
+///
+/// # Create MeshInstance3D to display it
+/// var mesh_instance = MeshInstance3D.new()
+/// mesh_instance.mesh = mesh
+/// add_child(mesh_instance)
+/// ```
+#[derive(GodotClass)]
+#[class(base=RefCounted, init)]
+pub struct VoxelMeshBuilder {
+    /// Size of each voxel in world units
+    voxel_size: f32,
+    /// Whether to generate vertex colors based on voxel type
+    use_vertex_colors: bool,
+    /// Color palette for voxel types (index = voxel type)
+    color_palette: Vec<Color>,
+    base: Base<RefCounted>,
+}
+
+#[godot_api]
+impl VoxelMeshBuilder {
+    /// Creates a new VoxelMeshBuilder with default settings.
+    #[func]
+    pub fn create() -> Gd<Self> {
+        Gd::from_init_fn(|base| Self {
+            voxel_size: 1.0,
+            use_vertex_colors: true,
+            color_palette: Self::default_palette(),
+            base,
+        })
+    }
+
+    /// Sets the size of each voxel in world units.
+    #[func]
+    pub fn set_voxel_size(&mut self, size: f32) {
+        self.voxel_size = size.max(0.001);
+    }
+
+    /// Gets the current voxel size.
+    #[func]
+    pub fn get_voxel_size(&self) -> f32 {
+        self.voxel_size
+    }
+
+    /// Enables or disables vertex colors based on voxel type.
+    #[func]
+    pub fn set_use_vertex_colors(&mut self, enabled: bool) {
+        self.use_vertex_colors = enabled;
+    }
+
+    /// Sets a color for a specific voxel type in the palette.
+    ///
+    /// # Arguments
+    /// * `voxel_type` - The voxel type (1-65535, 0 is empty)
+    /// * `color` - The color to use for this voxel type
+    #[func]
+    pub fn set_voxel_color(&mut self, voxel_type: i32, color: Color) {
+        let idx = voxel_type.max(0) as usize;
+        if idx >= self.color_palette.len() {
+            self.color_palette.resize(idx + 1, Color::WHITE);
+        }
+        self.color_palette[idx] = color;
+    }
+
+    /// Gets the color for a specific voxel type.
+    #[func]
+    pub fn get_voxel_color(&self, voxel_type: i32) -> Color {
+        let idx = voxel_type.max(0) as usize;
+        self.color_palette
+            .get(idx)
+            .copied()
+            .unwrap_or(Color::WHITE)
+    }
+
+    /// Sets the entire color palette from an array.
+    #[func]
+    pub fn set_color_palette(&mut self, colors: Array<Color>) {
+        self.color_palette = colors.iter_shared().collect();
+    }
+
+    /// Creates a default color palette with common voxel colors.
+    fn default_palette() -> Vec<Color> {
+        vec![
+            Color::from_rgba(0.0, 0.0, 0.0, 0.0),     // 0: Empty (transparent)
+            Color::from_rgba(0.5, 0.5, 0.5, 1.0),     // 1: Stone (gray)
+            Color::from_rgba(0.4, 0.25, 0.13, 1.0),   // 2: Dirt (brown)
+            Color::from_rgba(0.2, 0.6, 0.2, 1.0),     // 3: Grass (green)
+            Color::from_rgba(0.6, 0.5, 0.3, 1.0),     // 4: Sand (tan)
+            Color::from_rgba(0.3, 0.5, 0.8, 1.0),     // 5: Water (blue)
+            Color::from_rgba(0.5, 0.35, 0.2, 1.0),    // 6: Wood (brown)
+            Color::from_rgba(0.3, 0.5, 0.3, 1.0),     // 7: Leaves (dark green)
+            Color::from_rgba(0.9, 0.9, 0.9, 1.0),     // 8: Snow (white)
+            Color::from_rgba(0.8, 0.4, 0.1, 1.0),     // 9: Copper (orange)
+            Color::from_rgba(0.8, 0.8, 0.2, 1.0),     // 10: Gold (yellow)
+            Color::from_rgba(0.6, 0.6, 0.7, 1.0),     // 11: Iron (silver)
+            Color::from_rgba(0.2, 0.2, 0.2, 1.0),     // 12: Coal (dark gray)
+            Color::from_rgba(0.4, 0.1, 0.1, 1.0),     // 13: Redstone (red)
+            Color::from_rgba(0.1, 0.5, 0.8, 1.0),     // 14: Diamond (cyan)
+            Color::from_rgba(0.5, 0.2, 0.6, 1.0),     // 15: Amethyst (purple)
+        ]
+    }
+
+    /// Builds a mesh from a VoxelTree using culled face generation.
+    ///
+    /// This method only generates faces for voxels that are visible (not
+    /// completely surrounded by other solid voxels), which significantly
+    /// reduces the polygon count.
+    ///
+    /// # Arguments
+    /// * `interner` - The VoxelInterner managing memory
+    /// * `tree` - The VoxelTree to generate a mesh from
+    ///
+    /// # Returns
+    /// An ArrayMesh ready to be used with MeshInstance3D.
+    #[func]
+    pub fn build_mesh(&self, interner: Gd<VoxelInterner>, tree: Gd<VoxelTree>) -> Gd<ArrayMesh> {
+        let mut mesh = ArrayMesh::new_gd();
+
+        let tree_bind = tree.bind();
+        let Some(ref vox_tree) = tree_bind.tree else {
+            godot_error!("VoxelMeshBuilder::build_mesh: VoxelTree not initialized");
+            return mesh;
+        };
+
+        if vox_tree.get_root_id().is_empty() {
+            // Empty tree, return empty mesh
+            return mesh;
+        }
+
+        let interner_arc = interner.bind().get_arc();
+        let interner_guard = interner_arc.read().unwrap();
+
+        let resolution = 1i32 << tree_bind.max_depth;
+        let size = self.voxel_size;
+
+        // Collect mesh data
+        let mut vertices: Vec<Vector3> = Vec::new();
+        let mut normals: Vec<Vector3> = Vec::new();
+        let mut uvs: Vec<Vector2> = Vec::new();
+        let mut colors: Vec<Color> = Vec::new();
+        let mut indices: Vec<i32> = Vec::new();
+
+        // Iterate through all voxels
+        for x in 0..resolution {
+            for y in 0..resolution {
+                for z in 0..resolution {
+                    let pos = IVec3::new(x, y, z);
+                    let voxel = vox_tree.get(&interner_guard, pos);
+
+                    // Skip empty voxels
+                    let voxel_type = match voxel {
+                        Some(v) if v > 0 => v,
+                        _ => continue,
+                    };
+
+                    let world_pos =
+                        Vector3::new(x as f32 * size, y as f32 * size, z as f32 * size);
+                    let color = self.get_voxel_color(voxel_type as i32);
+
+                    // Check each face
+                    for face in ALL_FACES {
+                        let neighbor_pos = pos + face.offset();
+
+                        // Check if neighbor is outside bounds or empty
+                        let neighbor_empty = if neighbor_pos.x < 0
+                            || neighbor_pos.x >= resolution
+                            || neighbor_pos.y < 0
+                            || neighbor_pos.y >= resolution
+                            || neighbor_pos.z < 0
+                            || neighbor_pos.z >= resolution
+                        {
+                            true
+                        } else {
+                            match vox_tree.get(&interner_guard, neighbor_pos) {
+                                Some(v) if v > 0 => false,
+                                _ => true,
+                            }
+                        };
+
+                        // Only generate face if neighbor is empty
+                        if neighbor_empty {
+                            let base_idx = vertices.len() as i32;
+                            let face_verts = face.vertices(world_pos, size);
+                            let face_uvs = face.uvs();
+                            let normal = face.normal();
+
+                            // Add 4 vertices for this face
+                            for i in 0..4 {
+                                vertices.push(face_verts[i]);
+                                normals.push(normal);
+                                uvs.push(face_uvs[i]);
+                                colors.push(color);
+                            }
+
+                            // Add 2 triangles (6 indices)
+                            indices.push(base_idx);
+                            indices.push(base_idx + 1);
+                            indices.push(base_idx + 2);
+                            indices.push(base_idx);
+                            indices.push(base_idx + 2);
+                            indices.push(base_idx + 3);
+                        }
+                    }
+                }
+            }
+        }
+
+        if vertices.is_empty() {
+            return mesh;
+        }
+
+        // Convert to packed arrays
+        let mut vert_arr = PackedVector3Array::new();
+        let mut norm_arr = PackedVector3Array::new();
+        let mut uv_arr = PackedVector2Array::new();
+        let mut color_arr = PackedColorArray::new();
+        let mut idx_arr = PackedInt32Array::new();
+
+        for v in &vertices {
+            vert_arr.push(*v);
+        }
+        for n in &normals {
+            norm_arr.push(*n);
+        }
+        for uv in &uvs {
+            uv_arr.push(*uv);
+        }
+        for c in &colors {
+            color_arr.push(*c);
+        }
+        for i in &indices {
+            idx_arr.push(*i);
+        }
+
+        // Create mesh arrays using varray! macro
+        // ArrayType::MAX gives us the size needed
+        let array_size = ArrayType::MAX.ord() as usize;
+        let mut arrays: VarArray = varray![];
+        arrays.resize(array_size, &Variant::nil());
+
+        arrays.set(ArrayType::VERTEX.ord() as usize, &vert_arr.to_variant());
+        arrays.set(ArrayType::NORMAL.ord() as usize, &norm_arr.to_variant());
+        arrays.set(ArrayType::TEX_UV.ord() as usize, &uv_arr.to_variant());
+        if self.use_vertex_colors {
+            arrays.set(ArrayType::COLOR.ord() as usize, &color_arr.to_variant());
+        }
+        arrays.set(ArrayType::INDEX.ord() as usize, &idx_arr.to_variant());
+
+        mesh.add_surface_from_arrays(PrimitiveType::TRIANGLES, &arrays);
+
+        mesh
+    }
+
+    /// Builds a mesh from a specific chunk in a VoxelWorld.
+    ///
+    /// # Arguments
+    /// * `interner` - The VoxelInterner managing memory
+    /// * `world` - The VoxelWorld containing the chunk
+    /// * `chunk_pos` - The chunk coordinates to generate a mesh for
+    ///
+    /// # Returns
+    /// An ArrayMesh ready to be used with MeshInstance3D, or empty if chunk doesn't exist.
+    #[func]
+    pub fn build_chunk_mesh(
+        &self,
+        interner: Gd<VoxelInterner>,
+        world: Gd<VoxelWorld>,
+        chunk_pos: Vector3i,
+    ) -> Gd<ArrayMesh> {
+        let world_bind = world.bind();
+        let key = (chunk_pos.x, chunk_pos.y, chunk_pos.z);
+
+        if let Some(chunk) = world_bind.chunks.get(&key) {
+            self.build_mesh(interner, chunk.clone())
+        } else {
+            ArrayMesh::new_gd()
+        }
+    }
+
+    /// Returns statistics about what a mesh build would produce.
+    ///
+    /// Useful for debugging and optimization.
+    #[func]
+    pub fn get_mesh_stats(&self, interner: Gd<VoxelInterner>, tree: Gd<VoxelTree>) -> VarDictionary {
+        let mut stats = VarDictionary::new();
+
+        let tree_bind = tree.bind();
+        let Some(ref vox_tree) = tree_bind.tree else {
+            stats.set("error", "VoxelTree not initialized");
+            return stats;
+        };
+
+        let interner_arc = interner.bind().get_arc();
+        let interner_guard = interner_arc.read().unwrap();
+
+        let resolution = 1i32 << tree_bind.max_depth;
+        let mut solid_voxels = 0i64;
+        let mut visible_faces = 0i64;
+
+        for x in 0..resolution {
+            for y in 0..resolution {
+                for z in 0..resolution {
+                    let pos = IVec3::new(x, y, z);
+                    let voxel = vox_tree.get(&interner_guard, pos);
+
+                    if let Some(v) = voxel {
+                        if v > 0 {
+                            solid_voxels += 1;
+
+                            for face in ALL_FACES {
+                                let neighbor_pos = pos + face.offset();
+                                let neighbor_empty = if neighbor_pos.x < 0
+                                    || neighbor_pos.x >= resolution
+                                    || neighbor_pos.y < 0
+                                    || neighbor_pos.y >= resolution
+                                    || neighbor_pos.z < 0
+                                    || neighbor_pos.z >= resolution
+                                {
+                                    true
+                                } else {
+                                    match vox_tree.get(&interner_guard, neighbor_pos) {
+                                        Some(v) if v > 0 => false,
+                                        _ => true,
+                                    }
+                                };
+
+                                if neighbor_empty {
+                                    visible_faces += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stats.set("resolution", resolution);
+        stats.set("total_possible_voxels", (resolution as i64).pow(3));
+        stats.set("solid_voxels", solid_voxels);
+        stats.set("visible_faces", visible_faces);
+        stats.set("estimated_vertices", visible_faces * 4);
+        stats.set("estimated_triangles", visible_faces * 2);
+
+        stats
+    }
+
+    /// Creates a default material suitable for voxel meshes with vertex colors.
+    ///
+    /// This function requires the `codegen-full` feature to be enabled.
+    #[cfg(feature = "codegen-full")]
+    #[func]
+    pub fn create_default_material() -> Gd<godot::classes::StandardMaterial3D> {
+        use godot::classes::base_material_3d;
+        let mut material = godot::classes::StandardMaterial3D::new_gd();
+        material.set_flag(base_material_3d::Flags::ALBEDO_FROM_VERTEX_COLOR, true);
+        material.set_shading_mode(base_material_3d::ShadingMode::PER_PIXEL);
+        material
+    }
+}
+
+// ============================================================================
+// VoxelChunkRenderer - Automatic mesh management for VoxelWorld
+// ============================================================================
+
+/// Automatic mesh management for rendering VoxelWorld chunks.
+///
+/// VoxelChunkRenderer handles the creation, updating, and cleanup of
+/// MeshInstance3D nodes for each chunk in a VoxelWorld.
+///
+/// # Example
+/// ```gdscript
+/// extends Node3D
+///
+/// var interner: VoxelInterner
+/// var world: VoxelWorld
+/// var renderer: VoxelChunkRenderer
+///
+/// func _ready():
+///     interner = VoxelInterner.new()
+///     world = VoxelWorld.create(5)
+///     renderer = VoxelChunkRenderer.new()
+///     renderer.set_world(world)
+///     renderer.set_interner(interner)
+///     
+///     # Modify voxels and mark chunks dirty
+///     world.set_voxel(interner, Vector3i(0, 0, 0), 1)
+///     renderer.mark_chunk_dirty(Vector3i(0, 0, 0))
+///     
+///     # Build mesh for the dirty chunk
+///     var mesh = renderer.build_chunk(Vector3i(0, 0, 0))
+/// ```
+#[derive(GodotClass)]
+#[class(base=RefCounted, init)]
+pub struct VoxelChunkRenderer {
+    /// The VoxelWorld to render
+    world: Option<Gd<VoxelWorld>>,
+    /// The VoxelInterner for memory
+    interner: Option<Gd<VoxelInterner>>,
+    /// Mesh builder for generating meshes
+    mesh_builder: Gd<VoxelMeshBuilder>,
+    /// Dirty chunks that need re-meshing
+    dirty_chunks: std::collections::HashSet<(i32, i32, i32)>,
+    base: Base<RefCounted>,
+}
+
+#[godot_api]
+impl VoxelChunkRenderer {
+    /// Creates a new VoxelChunkRenderer.
+    #[func]
+    pub fn create() -> Gd<Self> {
+        Gd::from_init_fn(|base| Self {
+            world: None,
+            interner: None,
+            mesh_builder: VoxelMeshBuilder::create(),
+            dirty_chunks: std::collections::HashSet::new(),
+            base,
+        })
+    }
+
+    /// Sets the VoxelWorld to render.
+    #[func]
+    pub fn set_world(&mut self, world: Gd<VoxelWorld>) {
+        self.world = Some(world);
+    }
+
+    /// Sets the VoxelInterner for memory management.
+    #[func]
+    pub fn set_interner(&mut self, interner: Gd<VoxelInterner>) {
+        self.interner = Some(interner);
+    }
+
+    /// Gets the mesh builder for customization.
+    #[func]
+    pub fn get_mesh_builder(&self) -> Gd<VoxelMeshBuilder> {
+        self.mesh_builder.clone()
+    }
+
+    /// Sets a custom mesh builder.
+    #[func]
+    pub fn set_mesh_builder(&mut self, builder: Gd<VoxelMeshBuilder>) {
+        self.mesh_builder = builder;
+    }
+
+    /// Marks a chunk as dirty (needs re-meshing).
+    ///
+    /// # Arguments
+    /// * `chunk_pos` - The chunk coordinates to mark dirty
+    #[func]
+    pub fn mark_chunk_dirty(&mut self, chunk_pos: Vector3i) {
+        self.dirty_chunks
+            .insert((chunk_pos.x, chunk_pos.y, chunk_pos.z));
+    }
+
+    /// Marks the chunk containing a world position as dirty.
+    #[func]
+    pub fn mark_dirty_at(&mut self, world_pos: Vector3i) {
+        if let Some(ref world) = self.world {
+            let chunk_pos = world.bind().world_to_chunk(world_pos);
+            self.mark_chunk_dirty(chunk_pos);
+        }
+    }
+
+    /// Marks all loaded chunks as dirty.
+    #[func]
+    pub fn mark_all_dirty(&mut self) {
+        if let Some(ref world) = self.world {
+            let loaded = world.bind().get_loaded_chunks();
+            for chunk_pos in loaded.iter_shared() {
+                self.dirty_chunks
+                    .insert((chunk_pos.x, chunk_pos.y, chunk_pos.z));
+            }
+        }
+    }
+
+    /// Returns the number of dirty chunks pending update.
+    #[func]
+    pub fn get_dirty_count(&self) -> i32 {
+        self.dirty_chunks.len() as i32
+    }
+
+    /// Clears the dirty chunk list.
+    #[func]
+    pub fn clear_dirty(&mut self) {
+        self.dirty_chunks.clear();
+    }
+
+    /// Returns whether there are any dirty chunks.
+    #[func]
+    pub fn has_dirty_chunks(&self) -> bool {
+        !self.dirty_chunks.is_empty()
+    }
+
+    /// Gets the list of dirty chunk positions.
+    #[func]
+    pub fn get_dirty_chunks(&self) -> Array<Vector3i> {
+        let mut arr = Array::new();
+        for (x, y, z) in &self.dirty_chunks {
+            arr.push(Vector3i::new(*x, *y, *z));
+        }
+        arr
+    }
+
+    /// Builds mesh for a single chunk. Returns the ArrayMesh or null if world/interner not set.
+    #[func]
+    pub fn build_chunk(&self, chunk_pos: Vector3i) -> Option<Gd<ArrayMesh>> {
+        let world = self.world.as_ref()?;
+        let interner = self.interner.as_ref()?;
+
+        Some(
+            self.mesh_builder
+                .bind()
+                .build_chunk_mesh(interner.clone(), world.clone(), chunk_pos),
+        )
     }
 }
